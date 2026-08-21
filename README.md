@@ -74,7 +74,7 @@ Use the `Entity-labeled only: 2025 Q3 and Q4` checkbox in the app when you want 
 
 - CMS-suppressed dollar cells are counted in outcome totals, but excluded from amount statistics and recommendation modeling.
 - The historical outcome plot shows every exact-filter row with a reported provider offer and provider/plan outcome. Green dots are provider wins and red dots are plan wins; hovering shows the row details available in the local dataset.
-- The offer curve is a decision-sensitivity model, not a causal estimate from raw offer-size correlations. It starts with the selected model cohort's base provider win rate and discounts it as fewer historical provider-winning offer-to-QPA ratios support a higher proposed amount.
+- The offer curve estimates the local historical provider win rate among rows with nearby provider offer amounts, using adaptive nearest-neighbor smoothing and modest shrinkage toward the selected model cohort's base win rate. The supported curve may rise or fall with the observed outcomes and is not a causal estimate of changing the offer on the same case.
 - The offer curve uses a linear dollar axis beginning at the lowest provider offer in the exact selected cohort. Its default endpoint is that cohort's 99th-percentile provider offer.
 - `Show extrapolation` reveals a dashed sensitivity tail that includes the highest exact-cohort provider offer and decays to zero at the tail endpoint. Extrapolated points are never eligible for recommendation.
 - Double-click the offer curve's rightmost x-axis amount to enter a smaller maximum for the current view.

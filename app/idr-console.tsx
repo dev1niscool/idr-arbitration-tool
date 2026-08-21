@@ -111,7 +111,7 @@ type ModelResult = {
   conservative: ModelPoint | null;
   modelRows: number;
   scope: string;
-  usedDefaults: boolean;
+  includesDefaults: boolean;
   medianQpa: number | null;
   lossPayment: number | null;
   baseWinRate: number | null;
@@ -312,19 +312,13 @@ function summarize(records: RecordTuple[]): BasicStats {
   };
 }
 
-function contestedModelRows(records: RecordTuple[], allowDefaults: boolean) {
-  return records.filter((record) => {
-    if (!allowDefaults && record[11] !== 0) return false;
-    return (
+function offerOutcomeRows(records: RecordTuple[]) {
+  return records.filter(
+    (record) =>
       (record[10] === 0 || record[10] === 1) &&
-      isFiniteNumber(record[6]) &&
-      record[6] > 0 &&
       isFiniteNumber(record[7]) &&
-      record[7] > 0 &&
-      isFiniteNumber(record[8]) &&
-      record[8] > 0
-    );
-  });
+      record[7] > 0,
+  );
 }
 
 function interpolatePoint(points: ModelPoint[], amount: number): ModelPoint | null {
@@ -367,23 +361,26 @@ function buildModel(
     | {
         label: string;
         rows: RecordTuple[];
-        usedDefaults: boolean;
+        includesDefaults: boolean;
       }
     | null = null;
 
   for (const scope of scopes) {
-    const nonDefault = contestedModelRows(scope.records, false);
-    if (nonDefault.length >= 25) {
-      chosen = { label: scope.label, rows: nonDefault, usedDefaults: false };
+    const rows = offerOutcomeRows(scope.records);
+    if (rows.length >= 25) {
+      chosen = {
+        label: scope.label,
+        rows,
+        includesDefaults: rows.some((record) => record[11] === 1),
+      };
       break;
     }
-    const withDefaults = contestedModelRows(scope.records, true);
-    if (withDefaults.length >= 25) {
-      chosen = { label: scope.label, rows: withDefaults, usedDefaults: true };
-      break;
-    }
-    if (!chosen || withDefaults.length > chosen.rows.length) {
-      chosen = { label: scope.label, rows: withDefaults, usedDefaults: true };
+    if (!chosen || rows.length > chosen.rows.length) {
+      chosen = {
+        label: scope.label,
+        rows,
+        includesDefaults: rows.some((record) => record[11] === 1),
+      };
     }
   }
 
@@ -392,18 +389,9 @@ function buildModel(
   const qpas = chosen.rows.map((record) => record[6]).filter(isFiniteNumber).filter((value) => value > 0);
   const issuerOffers = chosen.rows.map((record) => record[8]).filter(isFiniteNumber).filter((value) => value > 0);
   const providerOffers = chosen.rows.map((record) => record[7]).filter(isFiniteNumber).filter((value) => value > 0);
-  const ratios = chosen.rows
-    .map((record) => (isFiniteNumber(record[6]) && record[6] > 0 && isFiniteNumber(record[7]) ? record[7] / record[6] : null))
-    .filter(isFiniteNumber)
-    .filter((value) => value > 0);
-  const winningRatios = chosen.rows
-    .filter((record) => record[10] === 0)
-    .map((record) => (isFiniteNumber(record[6]) && record[6] > 0 && isFiniteNumber(record[7]) ? record[7] / record[6] : null))
-    .filter(isFiniteNumber)
-    .filter((value) => value > 0);
   const medianQpa = median(qpas);
-  const lossPayment = median(issuerOffers);
-  if (!medianQpa || !lossPayment || !ratios.length || !providerOffers.length || !winningRatios.length) return null;
+  const lossPayment = median(issuerOffers) ?? 0;
+  if (!providerOffers.length) return null;
 
   const wins = chosen.rows.filter((record) => record[10] === 0).length;
   const losses = chosen.rows.filter((record) => record[10] === 1).length;
@@ -414,26 +402,39 @@ function buildModel(
   const amountMin = observedAmountMin;
   const evidenceAmountMax = Math.max(amountMin + 100, quantile(rangeOffers, 0.99) ?? observedAmountMax);
   const amountMax = Math.max(evidenceAmountMax + 100, observedAmountMax, roundOffer(evidenceAmountMax * 1.25));
-  const supportBandwidth = chosen.rows.length >= 250 ? 0.34 : 0.46;
-  const referenceRatio = Math.min(...ratios);
+  const modelSamples = chosen.rows.map((record) => ({
+    logAmount: Math.log(record[7] as number),
+    providerWon: record[10] === 0 ? 1 : 0,
+  }));
+  const neighborCount = Math.min(modelSamples.length, Math.max(60, Math.ceil(modelSamples.length * 0.18)));
+  const priorWeight = Math.min(20, Math.max(8, Math.sqrt(modelSamples.length) / 2));
 
-  function winningSupport(offerRatio: number) {
-    const logOfferRatio = Math.log(Math.max(0.0001, offerRatio));
-    let support = 0;
-    let supportSquared = 0;
-    for (const winningRatio of winningRatios) {
-      const z = (Math.log(winningRatio) - logOfferRatio) / supportBandwidth;
-      const weight = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
-      support += weight;
-      supportSquared += weight * weight;
+  function localWinEstimate(amount: number) {
+    const target = Math.log(Math.max(1, amount));
+    const neighbors = modelSamples
+      .map((sample) => ({ ...sample, distance: Math.abs(sample.logAmount - target) }))
+      .sort((left, right) => left.distance - right.distance)
+      .slice(0, neighborCount);
+    const bandwidth = neighbors.at(-1)?.distance ?? 0;
+    let weightedRows = 0;
+    let weightedWins = 0;
+    let squaredWeights = 0;
+
+    for (const neighbor of neighbors) {
+      const scaledDistance = bandwidth > 0 ? Math.min(1, neighbor.distance / bandwidth) : 0;
+      const weight = Math.pow(1 - Math.pow(scaledDistance, 3), 3);
+      weightedRows += weight;
+      weightedWins += weight * neighbor.providerWon;
+      squaredWeights += weight * weight;
     }
+
+    const priorWins = (baseWinRate ?? 0.5) * priorWeight;
     return {
-      rate: support / winningRatios.length,
-      effectiveN: supportSquared > 0 ? (support * support) / supportSquared : 0,
+      probability: (weightedWins + priorWins) / Math.max(0.0001, weightedRows + priorWeight),
+      effectiveN: squaredWeights > 0 ? (weightedRows * weightedRows) / squaredWeights : 0,
     };
   }
 
-  const referenceSupport = Math.max(0.0001, winningSupport(referenceRatio).rate);
   const candidateAmounts = new Set<number>([amountMin, amountMax, evidenceAmountMax]);
   for (let index = 0; index < 160; index += 1) {
     const t = index / 159;
@@ -449,19 +450,21 @@ function buildModel(
   }
 
   const tailSpan = Math.max(1, amountMax - evidenceAmountMax);
+  const boundaryEstimate = localWinEstimate(evidenceAmountMax);
   const points = Array.from(candidateAmounts)
     .filter((amount) => amount > 0 && amount <= amountMax)
     .sort((a, b) => a - b)
     .map((amount) => {
-      const offerRatio = amount / medianQpa;
-      const support = winningSupport(offerRatio);
       const extrapolated = amount > evidenceAmountMax;
       const progress = extrapolated ? Math.min(1, (amount - evidenceAmountMax) / tailSpan) : 0;
       const smoothProgress = progress * progress * (3 - 2 * progress);
-      const supportedProbability = (baseWinRate ?? 0.5) * (support.rate / referenceSupport);
-      const winProbability = Math.min(baseWinRate ?? 0.995, Math.max(0, supportedProbability * (1 - smoothProgress)));
+      const localEstimate = extrapolated ? boundaryEstimate : localWinEstimate(amount);
+      const winProbability = extrapolated
+        ? localEstimate.probability * (1 - smoothProgress)
+        : localEstimate.probability;
       const expectedPayment = winProbability * amount + (1 - winProbability) * lossPayment;
-      return { amount, winProbability, expectedPayment, effectiveN: support.effectiveN, extrapolated };
+      const effectiveN = extrapolated ? localEstimate.effectiveN * (1 - smoothProgress) : localEstimate.effectiveN;
+      return { amount, winProbability, expectedPayment, effectiveN, extrapolated };
     });
 
   const recommendationPool = points.filter((point) => !point.extrapolated);
@@ -476,7 +479,7 @@ function buildModel(
     conservative,
     modelRows: chosen.rows.length,
     scope: chosen.label,
-    usedDefaults: chosen.usedDefaults,
+    includesDefaults: chosen.includesDefaults,
     medianQpa,
     lossPayment,
     baseWinRate,
@@ -743,7 +746,7 @@ function OfferCurve({
   if (!model || !model.points.length) {
     return (
       <div className="flex h-72 items-center justify-center rounded-md border border-slate-200 bg-slate-50 text-sm text-slate-500">
-        Not enough numeric contested rows for an offer curve.
+        Not enough provider-offer outcome rows for an offer curve.
       </div>
     );
   }
@@ -795,8 +798,8 @@ function OfferCurve({
 
   const tooltipX = focusPoint ? xFor(focusPoint.amount) : 0;
   const tooltipY = focusPoint ? yFor(focusPoint.winProbability) : 0;
-  const tooltipLeft = tooltipX > width - 230 ? tooltipX - 176 : tooltipX + 14;
-  const tooltipTop = Math.max(10, Math.min(height - 92, tooltipY - 68));
+  const tooltipLeft = tooltipX > width - 250 ? tooltipX - 208 : tooltipX + 14;
+  const tooltipTop = Math.max(10, Math.min(height - 108, tooltipY - 84));
 
   function commitAxisMax() {
     const parsed = Number(axisDraft.replace(/[$,\s]/g, ''));
@@ -873,12 +876,15 @@ function OfferCurve({
           <g>
             <line x1={tooltipX} x2={tooltipX} y1={padTop} y2={height - padBottom} stroke="#64748b" strokeDasharray="4 4" />
             <circle cx={tooltipX} cy={tooltipY} r="6" fill="#0f766e" stroke="#ffffff" strokeWidth="2" />
-            <rect x={tooltipLeft} y={tooltipTop} width="164" height="58" rx="6" fill="#0f172a" />
+            <rect x={tooltipLeft} y={tooltipTop} width="196" height="76" rx="6" fill="#0f172a" />
             <text x={tooltipLeft + 12} y={tooltipTop + 22} className="fill-white text-[13px] font-semibold">
               {formatMoney(focusPoint.amount)}
             </text>
             <text x={tooltipLeft + 12} y={tooltipTop + 43} className="fill-slate-200 text-[12px]">
               {formatPercent(focusPoint.winProbability, 1)} estimated win rate
+            </text>
+            <text x={tooltipLeft + 12} y={tooltipTop + 61} className="fill-slate-300 text-[11px]">
+              Local effective sample: {formatNumber(focusPoint.effectiveN)}
             </text>
           </g>
         ) : null}
@@ -1723,7 +1729,7 @@ export default function IdrConsole() {
                   />
                 </div>
                 <div className="mt-3 flex flex-wrap gap-x-6 gap-y-2 text-xs text-slate-500">
-                  <span><span className="mr-2 inline-block h-0.5 w-6 align-middle bg-teal-700" />Historical winning-offer support</span>
+                  <span><span className="mr-2 inline-block h-0.5 w-6 align-middle bg-teal-700" />Smoothed local historical win rate</span>
                   {showExtrapolation ? <span><span className="mr-2 inline-block w-6 border-t-2 border-dashed border-teal-700 align-middle" />Sensitivity tail to 0%</span> : null}
                   <span>Lowest exact-cohort offer: {formatMoney(model?.observedAmountMin)}</span>
                   <span>Default endpoint (99th percentile): {formatMoney(model?.evidenceAmountMax)}</span>
@@ -1757,8 +1763,8 @@ export default function IdrConsole() {
 
             <section className={activePage === 'strategy' ? 'rounded-lg border border-slate-200 bg-white p-5 text-sm leading-6 text-slate-600' : 'hidden'}>
               <h2 className="font-semibold text-slate-950">Model scope</h2>
-              <p className="mt-2">{model?.scope ?? 'No eligible model scope.'}{model?.usedDefaults ? ' Default decisions were included because the non-default sample was sparse.' : ''}</p>
-              <p className="mt-2">The solid curve starts at the lowest reported exact-cohort provider offer and discounts the model cohort&apos;s base win rate as fewer historical provider-winning offer/QPA ratios support a higher amount. The optional dashed tail begins at the exact cohort&apos;s 99th-percentile offer and decays to zero. Recommendations never use that extrapolated tail.</p>
+              <p className="mt-2">{model?.scope ?? 'No eligible model scope.'}{model?.includesDefaults ? ' Default decisions are included so the curve uses the same provider/plan outcome population as the historical case plot.' : ''}</p>
+              <p className="mt-2">The solid curve starts at the lowest reported exact-cohort provider offer. At each amount it estimates the provider win fraction among historical rows with nearby provider offers, then applies modest shrinkage toward the model cohort&apos;s base win rate. The optional dashed tail begins at the exact cohort&apos;s 99th-percentile offer and decays to zero. Recommendations never use that extrapolated tail.</p>
             </section>
 
             <section className={activePage === 'guide' ? 'space-y-5' : 'hidden'}>
@@ -1789,7 +1795,8 @@ export default function IdrConsole() {
                 <div><h2 className="text-lg font-semibold">How the curve works</h2><p className="mt-2 text-sm leading-6 text-slate-600">Raw outcomes and decision sensitivity are shown separately because historical offer size is confounded by case strength and selection.</p></div>
                 <div className="space-y-3 text-sm leading-6 text-slate-600">
                   <p>The case plot is the observed evidence. For some codes, including 63047 in the pooled data, raw win rates are flat or higher at larger offers. That does not establish that asking more improves the same case; stronger cases may both ask more and win more often.</p>
-                  <p>The offer curve is a winning-offer support model. It begins with the model cohort&apos;s base provider win rate, then reduces that probability according to the smoothed share of historical provider-winning offer/QPA ratios that reached or exceeded each proposed amount.</p>
+                  <p>The offer curve estimates the local historical provider win rate with an adaptive nearest-neighbor smoother. For every proposed amount, it compares provider wins and plan wins among rows with nearby provider offers and modestly shrinks the result toward the model cohort&apos;s overall win rate. The hover panel reports the effective local sample size.</p>
+                  <p>The supported curve is not forced downward. It may rise or fall where nearby historical outcomes do. This is an observational association, not proof that changing the offer alone causes the estimated change.</p>
                   <p>The solid linear axis starts at the lowest exact-cohort offer and normally ends at that cohort&apos;s 99th percentile. The optional dashed tail extends to the highest observed offer and decays to 0%. It is a sensitivity extrapolation, not observed CMS evidence.</p>
                   <p>Expected payment equals win probability times the provider offer, plus loss probability times the median issuer offer. It is not profit and does not include costs, fees, delays, or collection risk.</p>
                 </div>
