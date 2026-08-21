@@ -117,6 +117,7 @@ type ModelResult = {
   baseWinRate: number | null;
   amountMin: number;
   amountMax: number;
+  defaultAmountMax: number;
   evidenceAmountMax: number;
   observedAmountMin: number;
   observedAmountMax: number;
@@ -400,8 +401,9 @@ function buildModel(
   const observedAmountMin = Math.min(...rangeOffers);
   const observedAmountMax = Math.max(...rangeOffers);
   const amountMin = observedAmountMin;
-  const evidenceAmountMax = Math.max(amountMin + 100, quantile(rangeOffers, 0.99) ?? observedAmountMax);
-  const amountMax = Math.max(evidenceAmountMax + 100, observedAmountMax, roundOffer(evidenceAmountMax * 1.25));
+  const defaultAmountMax = Math.max(amountMin + 100, quantile(rangeOffers, 0.99) ?? observedAmountMax);
+  const evidenceAmountMax = Math.max(defaultAmountMax, observedAmountMax);
+  const amountMax = Math.max(evidenceAmountMax + 100, roundOffer(evidenceAmountMax * 1.25));
   const modelSamples = chosen.rows.map((record) => ({
     logAmount: Math.log(record[7] as number),
     providerWon: record[10] === 0 ? 1 : 0,
@@ -435,7 +437,7 @@ function buildModel(
     };
   }
 
-  const candidateAmounts = new Set<number>([amountMin, amountMax, evidenceAmountMax]);
+  const candidateAmounts = new Set<number>([amountMin, defaultAmountMax, evidenceAmountMax, amountMax]);
   for (let index = 0; index < 160; index += 1) {
     const t = index / 159;
     candidateAmounts.add(roundOffer(amountMin + (evidenceAmountMax - amountMin) * t));
@@ -467,7 +469,9 @@ function buildModel(
       return { amount, winProbability, expectedPayment, effectiveN, extrapolated };
     });
 
-  const recommendationPool = points.filter((point) => !point.extrapolated);
+  const recommendationPool = points.filter(
+    (point) => !point.extrapolated && point.amount <= defaultAmountMax,
+  );
   const recommended = chooseBest(recommendationPool, riskFloor);
   const aggressive = chooseBest(recommendationPool, 0);
   const conservative = chooseBest(recommendationPool, Math.max(riskFloor, 0.8));
@@ -485,6 +489,7 @@ function buildModel(
     baseWinRate,
     amountMin,
     amountMax,
+    defaultAmountMax,
     evidenceAmountMax,
     observedAmountMin,
     observedAmountMax,
@@ -1118,7 +1123,7 @@ export default function IdrConsole() {
     () => buildModel(modelScopes, riskFloor, selectedCohortOffers),
     [modelScopes, riskFloor, selectedCohortOffers],
   );
-  const offerAxisLimit = model ? (showExtrapolation ? model.amountMax : model.evidenceAmountMax) : 1;
+  const offerAxisLimit = model ? (showExtrapolation ? model.amountMax : model.defaultAmountMax) : 1;
   const offerAxisMax = model
     ? Math.max(model.amountMin + 1, Math.min(axisMaxOverride ?? offerAxisLimit, offerAxisLimit))
     : 1;
@@ -1181,7 +1186,7 @@ export default function IdrConsole() {
 
   function changeAxisMax(amount: number) {
     if (!model) return;
-    const limit = showExtrapolation ? model.amountMax : model.evidenceAmountMax;
+    const limit = showExtrapolation ? model.amountMax : model.defaultAmountMax;
     const next = Math.max(model.amountMin + 1, Math.min(limit, amount));
     setAxisMaxOverride(next);
     setOfferAmount((current) => (current === null ? current : Math.min(current, next)));
@@ -1703,7 +1708,7 @@ export default function IdrConsole() {
                           setAxisMaxOverride(null);
                           if (!checked && model) {
                             setOfferAmount((current) =>
-                              current === null ? current : Math.min(current, model.evidenceAmountMax),
+                              current === null ? current : Math.min(current, model.defaultAmountMax),
                             );
                           }
                         }}
@@ -1732,7 +1737,7 @@ export default function IdrConsole() {
                   <span><span className="mr-2 inline-block h-0.5 w-6 align-middle bg-teal-700" />Smoothed local historical win rate</span>
                   {showExtrapolation ? <span><span className="mr-2 inline-block w-6 border-t-2 border-dashed border-teal-700 align-middle" />Sensitivity tail to 0%</span> : null}
                   <span>Lowest exact-cohort offer: {formatMoney(model?.observedAmountMin)}</span>
-                  <span>Default endpoint (99th percentile): {formatMoney(model?.evidenceAmountMax)}</span>
+                  <span>Default endpoint (99th percentile): {formatMoney(model?.defaultAmountMax)}</span>
                   <span>Highest observed offer: {formatMoney(model?.observedAmountMax)}</span>
                 </div>
               </div>
@@ -1764,7 +1769,7 @@ export default function IdrConsole() {
             <section className={activePage === 'strategy' ? 'rounded-lg border border-slate-200 bg-white p-5 text-sm leading-6 text-slate-600' : 'hidden'}>
               <h2 className="font-semibold text-slate-950">Model scope</h2>
               <p className="mt-2">{model?.scope ?? 'No eligible model scope.'}{model?.includesDefaults ? ' Default decisions are included so the curve uses the same provider/plan outcome population as the historical case plot.' : ''}</p>
-              <p className="mt-2">The solid curve starts at the lowest reported exact-cohort provider offer. At each amount it estimates the provider win fraction among historical rows with nearby provider offers, then applies modest shrinkage toward the model cohort&apos;s base win rate. The optional dashed tail begins at the exact cohort&apos;s 99th-percentile offer and decays to zero. Recommendations never use that extrapolated tail.</p>
+              <p className="mt-2">The solid curve starts at the lowest reported exact-cohort provider offer. At each amount it estimates the provider win fraction among historical rows with nearby provider offers, then applies modest shrinkage toward the model cohort&apos;s base win rate. The default view ends at the 99th percentile; expanding the chart keeps the curve solid through the highest observed offer, then shows a dashed sensitivity tail to zero. Recommendations stay within the default range and never use that tail.</p>
             </section>
 
             <section className={activePage === 'guide' ? 'space-y-5' : 'hidden'}>
@@ -1797,7 +1802,7 @@ export default function IdrConsole() {
                   <p>The case plot is the observed evidence. For some codes, including 63047 in the pooled data, raw win rates are flat or higher at larger offers. That does not establish that asking more improves the same case; stronger cases may both ask more and win more often.</p>
                   <p>The offer curve estimates the local historical provider win rate with an adaptive nearest-neighbor smoother. For every proposed amount, it compares provider wins and plan wins among rows with nearby provider offers and modestly shrinks the result toward the model cohort&apos;s overall win rate. The hover panel reports the effective local sample size.</p>
                   <p>The supported curve is not forced downward. It may rise or fall where nearby historical outcomes do. This is an observational association, not proof that changing the offer alone causes the estimated change.</p>
-                  <p>The solid linear axis starts at the lowest exact-cohort offer and normally ends at that cohort&apos;s 99th percentile. The optional dashed tail extends to the highest observed offer and decays to 0%. It is a sensitivity extrapolation, not observed CMS evidence.</p>
+                  <p>The solid linear axis starts at the lowest exact-cohort offer and normally ends at that cohort&apos;s 99th percentile. Show extrapolation expands the solid empirical curve through the highest observed offer, then adds a dashed sensitivity tail beyond the observed maximum that decays to 0%.</p>
                   <p>Expected payment equals win probability times the provider offer, plus loss probability times the median issuer offer. It is not profit and does not include costs, fees, delays, or collection risk.</p>
                 </div>
               </div>

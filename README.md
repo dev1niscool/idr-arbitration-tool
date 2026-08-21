@@ -76,7 +76,7 @@ Use the `Entity-labeled only: 2025 Q3 and Q4` checkbox in the app when you want 
 - The historical outcome plot shows every exact-filter row with a reported provider offer and provider/plan outcome. Green dots are provider wins and red dots are plan wins; hovering shows the row details available in the local dataset.
 - The offer curve estimates the local historical provider win rate among rows with nearby provider offer amounts, using adaptive nearest-neighbor smoothing and modest shrinkage toward the selected model cohort's base win rate. The supported curve may rise or fall with the observed outcomes and is not a causal estimate of changing the offer on the same case.
 - The offer curve uses a linear dollar axis beginning at the lowest provider offer in the exact selected cohort. Its default endpoint is that cohort's 99th-percentile provider offer.
-- `Show extrapolation` reveals a dashed sensitivity tail that includes the highest exact-cohort provider offer and decays to zero at the tail endpoint. Extrapolated points are never eligible for recommendation.
+- `Show extrapolation` expands the solid curve through the highest observed exact-cohort offer, then reveals a dashed sensitivity tail beyond observed data that decays to zero. Extrapolated points are never eligible for recommendation.
 - Double-click the offer curve's rightmost x-axis amount to enter a smaller maximum for the current view.
 - Expected value uses the proposed provider offer if the provider wins and the median issuer offer as the loss-side proxy.
 - Multi-state CMS markets appear under every state named in the geography. For example, Chicago-Naperville-Elgin, IL-IN-WI is available under Illinois, Indiana, and Wisconsin.
