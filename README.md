@@ -80,4 +80,5 @@ Use the `Entity-labeled only: 2025 Q3 and Q4` checkbox in the app when you want 
 - `Show extrapolation` expands the solid curve through the highest observed exact-cohort offer, then reveals a dashed sensitivity tail beyond observed data that decays to zero. Extrapolated points are never eligible for recommendation.
 - Double-click the offer curve's rightmost x-axis amount to enter a smaller maximum for the current view.
 - Expected value uses the proposed provider offer if the provider wins and the median issuer offer as the loss-side proxy.
+- After selecting a state, the region checkbox menu can combine multiple city or market regions into one exact-filter cohort. Leaving every region unchecked includes all regions in that state.
 - Multi-state CMS markets appear under every state named in the geography. For example, Chicago-Naperville-Elgin, IL-IN-WI is available under Illinois, Indiana, and Wisconsin.

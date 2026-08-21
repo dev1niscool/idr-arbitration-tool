@@ -6,12 +6,14 @@ import {
   BookOpen,
   Calculator,
   Check,
+  ChevronDown,
   Database,
   FileSearch,
   Info,
   SlidersHorizontal,
+  X,
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 type RecordTuple = [
   number,
@@ -1178,12 +1180,127 @@ function OfferCurve({
   );
 }
 
+function RegionCheckboxDropdown({
+  stateName,
+  options,
+  selected,
+  onChange,
+}: {
+  stateName: string | null;
+  options: string[];
+  selected: Set<string>;
+  onChange: (regions: Set<string>) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const disabled = !stateName;
+  const selectedRegions = Array.from(selected);
+  const buttonLabel = disabled
+    ? 'Select a state first'
+    : selectedRegions.length === 0
+      ? `All ${stateName} regions`
+      : selectedRegions.length === 1
+        ? regionDisplayName(selectedRegions[0])
+        : `${selectedRegions.length} ${stateName} regions selected`;
+
+  useEffect(() => {
+    if (!open) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [open]);
+
+  function toggleRegion(region: string) {
+    const next = new Set(selected);
+    if (next.has(region)) next.delete(region);
+    else next.add(region);
+    onChange(next);
+  }
+
+  return (
+    <div ref={containerRef} className="relative mt-2">
+      <button
+        type="button"
+        disabled={disabled}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+        className="flex h-11 w-full items-center justify-between gap-3 rounded-md border border-slate-300 bg-white px-3 text-left text-sm outline-none transition hover:border-slate-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+      >
+        <span className="min-w-0 truncate">{buttonLabel}</span>
+        <ChevronDown size={17} className={`shrink-0 text-slate-500 transition ${open ? 'rotate-180' : ''}`} aria-hidden="true" />
+      </button>
+
+      {open && !disabled ? (
+        <div className="absolute z-40 mt-2 w-full overflow-hidden rounded-md border border-slate-200 bg-white shadow-xl" role="dialog" aria-label={`${stateName} regions`}>
+          <div className="flex items-center justify-between border-b border-slate-200 px-3 py-2.5">
+            <div>
+              <p className="text-sm font-semibold text-slate-800">Select regions</p>
+              <p className="text-xs text-slate-500">Checked regions are combined</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-800"
+              aria-label="Close region menu"
+            >
+              <X size={16} aria-hidden="true" />
+            </button>
+          </div>
+
+          <div className="max-h-64 overflow-y-auto p-2">
+            <label className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 text-sm font-medium text-slate-800 hover:bg-slate-50">
+              <input
+                type="checkbox"
+                checked={selected.size === 0}
+                onChange={() => onChange(new Set())}
+                className="h-4 w-4 accent-teal-700"
+              />
+              All {stateName} regions
+            </label>
+            <div className="my-1 border-t border-slate-100" />
+            {options.map((region) => (
+              <label key={region} className="flex cursor-pointer items-start gap-3 rounded-md px-2 py-2 text-sm text-slate-700 hover:bg-slate-50">
+                <input
+                  type="checkbox"
+                  checked={selected.has(region)}
+                  onChange={() => toggleRegion(region)}
+                  className="mt-0.5 h-4 w-4 shrink-0 accent-teal-700"
+                />
+                <span className="leading-5">{regionDisplayName(region)}</span>
+              </label>
+            ))}
+          </div>
+
+          <div className="flex items-center justify-between border-t border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+            <span>{selected.size ? `${selected.size} selected` : 'All regions included'}</span>
+            {selected.size ? (
+              <button type="button" onClick={() => onChange(new Set())} className="font-semibold text-teal-800 hover:text-teal-950">
+                Use all regions
+              </button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export default function IdrConsole() {
   const [data, setData] = useState<IdrData | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [codeInput, setCodeInput] = useState(DEFAULT_CODE);
   const [selectedState, setSelectedState] = useState(ALL);
-  const [selectedRegion, setSelectedRegion] = useState(ALL);
+  const [selectedRegions, setSelectedRegions] = useState<Set<string>>(new Set());
   const [selectedEntity, setSelectedEntity] = useState(ALL);
   const [selectedPlace, setSelectedPlace] = useState(ALL);
   const [selectedYears, setSelectedYears] = useState<Set<number>>(new Set(DEFAULT_YEARS));
@@ -1268,8 +1385,22 @@ export default function IdrConsole() {
     [regionsByState],
   );
   const activeState = selectedState !== ALL && regionsByState.has(selectedState) ? selectedState : ALL;
-  const cityRegionOptions = activeState === ALL ? regionOptions : regionsByState.get(activeState) ?? [];
-  const activeRegion = selectedRegion !== ALL && cityRegionOptions.includes(selectedRegion) ? selectedRegion : ALL;
+  const cityRegionOptions = useMemo(
+    () => (activeState === ALL ? [] : regionsByState.get(activeState) ?? []),
+    [activeState, regionsByState],
+  );
+  const activeRegions = useMemo(
+    () => new Set(Array.from(selectedRegions).filter((region) => cityRegionOptions.includes(region))),
+    [cityRegionOptions, selectedRegions],
+  );
+  const hasRegionFilter = activeRegions.size > 0;
+  const geographyLabel = hasRegionFilter
+    ? activeRegions.size === 1
+      ? regionDisplayName(Array.from(activeRegions)[0])
+      : `${activeRegions.size} ${STATE_NAMES[activeState]} regions`
+    : activeState !== ALL
+      ? `All ${STATE_NAMES[activeState]} regions`
+      : 'All geographies';
 
   const stateRecords = useMemo(() => {
     if (!data || activeState === ALL) return yearRecords;
@@ -1277,9 +1408,9 @@ export default function IdrConsole() {
   }, [activeState, data, yearRecords]);
 
   const regionRecords = useMemo(() => {
-    if (!data || activeRegion === ALL) return stateRecords;
-    return stateRecords.filter((record) => data.dictionaries.regions[record[1]] === activeRegion);
-  }, [activeRegion, data, stateRecords]);
+    if (!data || !hasRegionFilter) return stateRecords;
+    return stateRecords.filter((record) => activeRegions.has(data.dictionaries.regions[record[1]]));
+  }, [activeRegions, data, hasRegionFilter, stateRecords]);
 
   const entityOptions = useMemo(() => {
     if (!data) return [];
@@ -1317,24 +1448,25 @@ export default function IdrConsole() {
   const modelScopes = useMemo(() => {
     const scopes: { label: string; records: RecordTuple[] }[] = [];
     const exactLabels = [
-      activeRegion !== ALL ? activeRegion : activeState !== ALL ? STATE_NAMES[activeState] : 'all geographies',
+      geographyLabel,
       activeEntity === ALL ? 'all entities' : activeEntity,
       activePlace === ALL ? 'all places' : `POS ${activePlace}`,
     ];
     scopes.push({ label: `exact filters (${exactLabels.join(', ')})`, records: exactRecords });
     if (activePlace !== ALL) scopes.push({ label: 'selected code, geography, and entity across places', records: entityRecords });
     if (activeEntity !== ALL) scopes.push({ label: 'selected code and geography across entities', records: regionRecords });
-    if (activeRegion !== ALL) scopes.push({ label: 'selected code across regions in the selected state', records: stateRecords });
+    if (hasRegionFilter) scopes.push({ label: 'selected code across regions in the selected state', records: stateRecords });
     if (activeState !== ALL) scopes.push({ label: 'selected code across all geographies', records: yearRecords });
     scopes.push({ label: 'same procedure family across selected years', records: procedureRecords });
     return scopes.filter((scope, index, array) => scope.records.length && array.findIndex((item) => item.records === scope.records) === index);
   }, [
     activeEntity,
     activePlace,
-    activeRegion,
     activeState,
     entityRecords,
     exactRecords,
+    geographyLabel,
+    hasRegionFilter,
     procedureRecords,
     regionRecords,
     stateRecords,
@@ -1375,11 +1507,11 @@ export default function IdrConsole() {
   const entitySegments = useMemo(
     () =>
       groupSegments(
-        activeRegion === ALL ? stateRecords : regionRecords,
+        hasRegionFilter ? regionRecords : stateRecords,
         (record) => data?.dictionaries.entities[record[2]] ?? 'N/R',
         10,
       ),
-    [activeRegion, data, regionRecords, stateRecords],
+    [data, hasRegionFilter, regionRecords, stateRecords],
   );
   const geographySegments = useMemo(
     () =>
@@ -1524,7 +1656,7 @@ export default function IdrConsole() {
                   value={activeState}
                   onChange={(event) => {
                     setSelectedState(event.target.value);
-                    setSelectedRegion(ALL);
+                    setSelectedRegions(new Set());
                   }}
                   className={inputClass}
                 >
@@ -1534,11 +1666,13 @@ export default function IdrConsole() {
               </div>
 
               <div>
-                <label className="text-sm font-semibold text-slate-800" htmlFor="region">City or market region</label>
-                <select id="region" value={activeRegion} onChange={(event) => setSelectedRegion(event.target.value)} className={inputClass}>
-                  <option value={ALL}>{activeState === ALL ? 'All geographies' : `All ${STATE_NAMES[activeState]} regions`}</option>
-                  {cityRegionOptions.map((region) => <option key={region} value={region}>{regionDisplayName(region)}</option>)}
-                </select>
+                <p className="text-sm font-semibold text-slate-800">City or market regions</p>
+                <RegionCheckboxDropdown
+                  stateName={activeState === ALL ? null : STATE_NAMES[activeState]}
+                  options={cityRegionOptions}
+                  selected={activeRegions}
+                  onChange={setSelectedRegions}
+                />
                 <p className="mt-2 text-xs leading-5 text-slate-500">Multi-state CMS regions appear under every state named in the region.</p>
               </div>
 
@@ -1629,7 +1763,7 @@ export default function IdrConsole() {
       <section className="border-b border-slate-200 bg-slate-950 text-white">
         <div className="mx-auto grid w-full max-w-[1480px] gap-4 px-4 py-5 sm:px-7 lg:grid-cols-[0.9fr_1.2fr_1fr_0.7fr]">
           <div><p className="text-xs font-semibold uppercase text-slate-400">Procedure</p><p className="mt-1 text-sm font-semibold">{normalizedCode} - {selectedCodeInfo?.procedureTitle}</p></div>
-          <div><p className="text-xs font-semibold uppercase text-slate-400">Geography</p><p className="mt-1 text-sm font-semibold">{activeRegion !== ALL ? regionDisplayName(activeRegion) : activeState !== ALL ? `All ${STATE_NAMES[activeState]} regions` : 'All geographies'}</p></div>
+          <div><p className="text-xs font-semibold uppercase text-slate-400">Geography</p><p className="mt-1 text-sm font-semibold">{geographyLabel}</p></div>
           <div><p className="text-xs font-semibold uppercase text-slate-400">IDR entity</p><p className="mt-1 text-sm font-semibold">{activeEntity === ALL ? 'All entities' : activeEntity}</p></div>
           <div><p className="text-xs font-semibold uppercase text-slate-400">Period / POS</p><p className="mt-1 text-sm font-semibold">{selectedPeriodLabel} / {activePlace === ALL ? 'All POS' : `POS ${activePlace}`}</p></div>
         </div>
@@ -1693,22 +1827,8 @@ export default function IdrConsole() {
                 </div>
 
                 <div>
-                  <label className="text-sm font-semibold text-slate-800" htmlFor="region">
-                    Geography
-                  </label>
-                  <select
-                    id="region"
-                    value={activeRegion}
-                    onChange={(event) => setSelectedRegion(event.target.value)}
-                    className="mt-2 h-11 w-full rounded-md border border-slate-300 bg-white px-3 text-sm outline-none focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  >
-                    <option value={ALL}>All geographies</option>
-                    {regionOptions.map((region) => (
-                      <option key={region} value={region}>
-                        {region}
-                      </option>
-                    ))}
-                  </select>
+                  <p className="text-sm font-semibold text-slate-800">Geography</p>
+                  <p className="mt-2 text-sm text-slate-600">{geographyLabel}</p>
                 </div>
 
                 <div>
@@ -2060,7 +2180,7 @@ export default function IdrConsole() {
                 <div className="space-y-3 text-sm leading-6 text-slate-600">
                   <p>Matched {formatNumber(sourceRows)} local Federal IDR PUF rows across 2023-2025. Dataset generated {dataGenerated}.</p>
                   <p>CMS-suppressed dollar cells remain in outcome counts but are excluded from amount, ratio, and model calculations. Certified IDR Entity begins in 2025 Q3.</p>
-                  <p>State filtering parses every abbreviation in each published geography, so cross-state markets are available from every included state.</p>
+                  <p>After choosing a state, the region menu can combine any number of checked markets. State filtering parses every abbreviation in each published geography, so cross-state markets are available from every included state.</p>
                 </div>
               </div>
             </section>
