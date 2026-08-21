@@ -1,5 +1,16 @@
 'use client';
 
+import {
+  ArrowLeft,
+  BarChart3,
+  BookOpen,
+  Calculator,
+  Check,
+  Database,
+  FileSearch,
+  Info,
+  SlidersHorizontal,
+} from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 
 type RecordTuple = [
@@ -90,6 +101,7 @@ type ModelPoint = {
   winProbability: number;
   expectedPayment: number;
   effectiveN: number;
+  extrapolated: boolean;
 };
 
 type ModelResult = {
@@ -97,7 +109,6 @@ type ModelResult = {
   recommended: ModelPoint | null;
   aggressive: ModelPoint | null;
   conservative: ModelPoint | null;
-  selected: ModelPoint | null;
   modelRows: number;
   scope: string;
   usedDefaults: boolean;
@@ -106,6 +117,9 @@ type ModelResult = {
   baseWinRate: number | null;
   amountMin: number;
   amountMax: number;
+  evidenceAmountMax: number;
+  observedAmountMin: number;
+  observedAmountMax: number;
 };
 
 type SegmentRow = {
@@ -119,11 +133,28 @@ type SegmentRow = {
   medianPrevailing: number | null;
 };
 
+type ResultsPage = 'strategy' | 'outcomes' | 'breakdowns' | 'comparables' | 'guide';
+
 const ALL = '__all__';
-const DEFAULT_CODE = '22551';
+const DEFAULT_CODE = '63047';
 const DEFAULT_YEARS = [2023, 2024, 2025];
 const ENTITY_ONLY_PERIOD_LABEL = '2025 Q3-Q4';
 const ENTITY_NOT_REPORTED = 'Not reported in selected source';
+const UNKNOWN_REGIONS = new Set(['N/R', 'NR', 'N/A']);
+const STATE_NAMES: Record<string, string> = {
+  AK: 'Alaska', AL: 'Alabama', AR: 'Arkansas', AZ: 'Arizona', CA: 'California',
+  CO: 'Colorado', CT: 'Connecticut', DC: 'District of Columbia', DE: 'Delaware',
+  FL: 'Florida', GA: 'Georgia', HI: 'Hawaii', IA: 'Iowa', ID: 'Idaho',
+  IL: 'Illinois', IN: 'Indiana', KS: 'Kansas', KY: 'Kentucky', LA: 'Louisiana',
+  MA: 'Massachusetts', MD: 'Maryland', ME: 'Maine', MI: 'Michigan', MN: 'Minnesota',
+  MO: 'Missouri', MS: 'Mississippi', MT: 'Montana', NC: 'North Carolina',
+  ND: 'North Dakota', NE: 'Nebraska', NH: 'New Hampshire', NJ: 'New Jersey',
+  NM: 'New Mexico', NV: 'Nevada', NY: 'New York', OH: 'Ohio', OK: 'Oklahoma',
+  OR: 'Oregon', PA: 'Pennsylvania', PR: 'Puerto Rico', RI: 'Rhode Island',
+  SC: 'South Carolina', SD: 'South Dakota', TN: 'Tennessee', TX: 'Texas',
+  UT: 'Utah', VA: 'Virginia', VT: 'Vermont', WA: 'Washington', WI: 'Wisconsin',
+  WV: 'West Virginia', WY: 'Wyoming',
+};
 const moneyFormatter = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
@@ -168,6 +199,7 @@ async function readJson<T>(url: string): Promise<T> {
 
 function formatPercent(value: number | null | undefined, digits = 0) {
   if (!isFiniteNumber(value)) return 'N/R';
+  if (value > 0 && value < 0.005 && digits === 0) return '<1%';
   return `${(value * 100).toFixed(digits)}%`;
 }
 
@@ -187,12 +219,25 @@ function median(values: number[]) {
 
 function roundOffer(value: number) {
   if (!Number.isFinite(value) || value <= 0) return 0;
-  const step = value >= 100000 ? 1000 : value >= 10000 ? 500 : 100;
+  const step = value >= 1000000 ? 10000 : value >= 100000 ? 1000 : value >= 10000 ? 500 : 100;
   return Math.round(value / step) * step;
 }
 
 function uniqueSorted(values: string[]) {
   return Array.from(new Set(values)).sort((a, b) => a.localeCompare(b));
+}
+
+function regionStates(region: string) {
+  if (UNKNOWN_REGIONS.has(region)) return [];
+  const suffix = region.split(',').at(-1)?.trim() ?? '';
+  if (!/^[A-Z]{2}(?:-[A-Z]{2})*$/.test(suffix)) return [];
+  return suffix.split('-').filter((state) => state in STATE_NAMES);
+}
+
+function regionDisplayName(region: string) {
+  const parts = region.split(',');
+  if (parts.length < 2) return region;
+  return `${parts.slice(0, -1).join(',')} (${parts.at(-1)?.trim()})`;
 }
 
 function summarize(records: RecordTuple[]): BasicStats {
@@ -298,6 +343,7 @@ function interpolatePoint(points: ModelPoint[], amount: number): ModelPoint | nu
         winProbability: left.winProbability + (right.winProbability - left.winProbability) * t,
         expectedPayment: left.expectedPayment + (right.expectedPayment - left.expectedPayment) * t,
         effectiveN: left.effectiveN + (right.effectiveN - left.effectiveN) * t,
+        extrapolated: left.extrapolated || right.extrapolated,
       };
     }
   }
@@ -306,8 +352,7 @@ function interpolatePoint(points: ModelPoint[], amount: number): ModelPoint | nu
 
 function chooseBest(points: ModelPoint[], minWinProbability: number) {
   const eligible = points.filter((point) => point.winProbability >= minWinProbability);
-  const pool = eligible.length ? eligible : points;
-  return pool.reduce<ModelPoint | null>((best, point) => {
+  return eligible.reduce<ModelPoint | null>((best, point) => {
     if (!best || point.expectedPayment > best.expectedPayment) return point;
     return best;
   }, null);
@@ -316,7 +361,7 @@ function chooseBest(points: ModelPoint[], minWinProbability: number) {
 function buildModel(
   scopes: { label: string; records: RecordTuple[] }[],
   riskFloor: number,
-  selectedAmount: number | null,
+  selectedCohortOffers: number[],
 ): ModelResult | null {
   let chosen:
     | {
@@ -346,89 +391,89 @@ function buildModel(
 
   const qpas = chosen.rows.map((record) => record[6]).filter(isFiniteNumber).filter((value) => value > 0);
   const issuerOffers = chosen.rows.map((record) => record[8]).filter(isFiniteNumber).filter((value) => value > 0);
+  const providerOffers = chosen.rows.map((record) => record[7]).filter(isFiniteNumber).filter((value) => value > 0);
   const ratios = chosen.rows
+    .map((record) => (isFiniteNumber(record[6]) && record[6] > 0 && isFiniteNumber(record[7]) ? record[7] / record[6] : null))
+    .filter(isFiniteNumber)
+    .filter((value) => value > 0);
+  const winningRatios = chosen.rows
+    .filter((record) => record[10] === 0)
     .map((record) => (isFiniteNumber(record[6]) && record[6] > 0 && isFiniteNumber(record[7]) ? record[7] / record[6] : null))
     .filter(isFiniteNumber)
     .filter((value) => value > 0);
   const medianQpa = median(qpas);
   const lossPayment = median(issuerOffers);
-  if (!medianQpa || !lossPayment || !ratios.length) return null;
+  if (!medianQpa || !lossPayment || !ratios.length || !providerOffers.length || !winningRatios.length) return null;
 
   const wins = chosen.rows.filter((record) => record[10] === 0).length;
   const losses = chosen.rows.filter((record) => record[10] === 1).length;
   const baseWinRate = wins + losses ? wins / (wins + losses) : null;
-  const ratioLow = Math.max(0.15, (quantile(ratios, 0.03) ?? 0.5) * 0.7);
-  const ratioHigh = Math.min(800, Math.max((quantile(ratios, 0.98) ?? ratioLow * 3) * 1.35, ratioLow * 4));
-  const amountMin = Math.max(100, roundOffer(ratioLow * medianQpa));
-  const amountMax = Math.max(amountMin + 100, roundOffer(ratioHigh * medianQpa));
-  const bandwidth = chosen.rows.length >= 250 ? 0.45 : 0.58;
-  const priorStrength = chosen.rows.length >= 100 ? 8 : 14;
-  const prior = baseWinRate ?? 0.5;
+  const rangeOffers = selectedCohortOffers.length ? selectedCohortOffers : providerOffers;
+  const observedAmountMin = Math.min(...rangeOffers);
+  const observedAmountMax = Math.max(...rangeOffers);
+  const amountMin = observedAmountMin;
+  const evidenceAmountMax = Math.max(amountMin + 100, quantile(rangeOffers, 0.99) ?? observedAmountMax);
+  const amountMax = Math.max(evidenceAmountMax + 100, observedAmountMax, roundOffer(evidenceAmountMax * 1.25));
+  const supportBandwidth = chosen.rows.length >= 250 ? 0.34 : 0.46;
+  const referenceRatio = Math.min(...ratios);
 
-  const candidateAmounts = new Set<number>();
-  for (let index = 0; index < 90; index += 1) {
-    const t = index / 89;
-    const ratio = Math.exp(Math.log(ratioLow) + (Math.log(ratioHigh) - Math.log(ratioLow)) * t);
-    candidateAmounts.add(roundOffer(ratio * medianQpa));
+  function winningSupport(offerRatio: number) {
+    const logOfferRatio = Math.log(Math.max(0.0001, offerRatio));
+    let support = 0;
+    let supportSquared = 0;
+    for (const winningRatio of winningRatios) {
+      const z = (Math.log(winningRatio) - logOfferRatio) / supportBandwidth;
+      const weight = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
+      support += weight;
+      supportSquared += weight * weight;
+    }
+    return {
+      rate: support / winningRatios.length,
+      effectiveN: supportSquared > 0 ? (support * support) / supportSquared : 0,
+    };
   }
-  for (const percentile of [0.1, 0.25, 0.5, 0.75, 0.9]) {
-    const offer = quantile(chosen.rows.map((record) => record[7]).filter(isFiniteNumber), percentile);
+
+  const referenceSupport = Math.max(0.0001, winningSupport(referenceRatio).rate);
+  const candidateAmounts = new Set<number>([amountMin, amountMax, evidenceAmountMax]);
+  for (let index = 0; index < 160; index += 1) {
+    const t = index / 159;
+    candidateAmounts.add(roundOffer(amountMin + (evidenceAmountMax - amountMin) * t));
+  }
+  for (let index = 1; index < 80; index += 1) {
+    const t = index / 79;
+    candidateAmounts.add(roundOffer(evidenceAmountMax + (amountMax - evidenceAmountMax) * t));
+  }
+  for (const percentile of [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]) {
+    const offer = quantile(rangeOffers, percentile);
     if (offer) candidateAmounts.add(roundOffer(offer));
   }
-  if (selectedAmount) candidateAmounts.add(roundOffer(selectedAmount));
 
-  const rawPoints = Array.from(candidateAmounts)
-    .filter((amount) => amount > 0)
+  const tailSpan = Math.max(1, amountMax - evidenceAmountMax);
+  const points = Array.from(candidateAmounts)
+    .filter((amount) => amount > 0 && amount <= amountMax)
     .sort((a, b) => a - b)
     .map((amount) => {
       const offerRatio = amount / medianQpa;
-      const logOfferRatio = Math.log(offerRatio);
-      let weightSum = 0;
-      let weightSquaredSum = 0;
-      let weightedWins = 0;
-
-      for (const record of chosen.rows) {
-        const qpa = record[6];
-        const provider = record[7];
-        if (!isFiniteNumber(qpa) || qpa <= 0 || !isFiniteNumber(provider) || provider <= 0) continue;
-        const recordRatio = provider / qpa;
-        if (!Number.isFinite(recordRatio) || recordRatio <= 0) continue;
-        const distance = Math.log(recordRatio) - logOfferRatio;
-        const weight = Math.exp(-(distance * distance) / (2 * bandwidth * bandwidth));
-        weightSum += weight;
-        weightSquaredSum += weight * weight;
-        weightedWins += weight * (record[10] === 0 ? 1 : 0);
-      }
-
-      const smoothed = (weightedWins + prior * priorStrength) / (weightSum + priorStrength);
-      const winProbability = Math.min(0.98, Math.max(0.02, smoothed));
+      const support = winningSupport(offerRatio);
+      const extrapolated = amount > evidenceAmountMax;
+      const progress = extrapolated ? Math.min(1, (amount - evidenceAmountMax) / tailSpan) : 0;
+      const smoothProgress = progress * progress * (3 - 2 * progress);
+      const supportedProbability = (baseWinRate ?? 0.5) * (support.rate / referenceSupport);
+      const winProbability = Math.min(baseWinRate ?? 0.995, Math.max(0, supportedProbability * (1 - smoothProgress)));
       const expectedPayment = winProbability * amount + (1 - winProbability) * lossPayment;
-      const effectiveN = weightSquaredSum > 0 ? (weightSum * weightSum) / weightSquaredSum : 0;
-      return { amount, winProbability, expectedPayment, effectiveN };
+      return { amount, winProbability, expectedPayment, effectiveN: support.effectiveN, extrapolated };
     });
 
-  let monotone = 0.99;
-  const points = rawPoints.map((point) => {
-    monotone = Math.min(monotone, point.winProbability);
-    const winProbability = monotone;
-    return {
-      ...point,
-      winProbability,
-      expectedPayment: winProbability * point.amount + (1 - winProbability) * lossPayment,
-    };
-  });
-
-  const recommended = chooseBest(points, riskFloor);
-  const aggressive = chooseBest(points, 0.02);
-  const conservative = chooseBest(points, Math.max(riskFloor, 0.8));
-  const selected = selectedAmount ? interpolatePoint(points, selectedAmount) : recommended;
+  const recommendationPool = points.filter((point) => !point.extrapolated);
+  const recommended = chooseBest(recommendationPool, riskFloor);
+  const aggressive = chooseBest(recommendationPool, 0);
+  const conservative = chooseBest(recommendationPool, Math.max(riskFloor, 0.8));
 
   return {
     points,
     recommended,
     aggressive,
     conservative,
-    selected,
     modelRows: chosen.rows.length,
     scope: chosen.label,
     usedDefaults: chosen.usedDefaults,
@@ -437,6 +482,9 @@ function buildModel(
     baseWinRate,
     amountMin,
     amountMax,
+    evidenceAmountMax,
+    observedAmountMin,
+    observedAmountMax,
   };
 }
 
@@ -534,77 +582,164 @@ function SegmentTable({ title, rows }: { title: string; rows: SegmentRow[] }) {
   );
 }
 
-function InfoTabs({
-  activeTab,
-  onChange,
-}: {
-  activeTab: 'place' | 'strategy';
-  onChange: (tab: 'place' | 'strategy') => void;
-}) {
-  const tabClass = (tab: 'place' | 'strategy') =>
-    `h-10 rounded-md px-4 text-sm font-semibold ${
-      activeTab === tab
-        ? 'bg-teal-700 text-white'
-        : 'border border-slate-300 bg-white text-slate-700 hover:border-teal-500'
-    }`;
+function OutcomeCasePlot({ records, data }: { records: RecordTuple[]; data: IdrData }) {
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const outcomeRows = useMemo(
+    () =>
+      records.filter(
+        (record) =>
+          (record[10] === 0 || record[10] === 1) &&
+          isFiniteNumber(record[7]) &&
+          record[7] > 0,
+      ),
+    [records],
+  );
+
+  if (!outcomeRows.length) {
+    return (
+      <div className="flex h-72 items-center justify-center rounded-md border border-slate-200 bg-slate-50 text-sm text-slate-500">
+        No exact-filter rows report both a provider offer and a provider/plan outcome.
+      </div>
+    );
+  }
+
+  const width = 920;
+  const height = 350;
+  const padLeft = 116;
+  const padRight = 32;
+  const padTop = 28;
+  const padBottom = 58;
+  const chartWidth = width - padLeft - padRight;
+  const minOffer = Math.min(...outcomeRows.map((record) => record[7] as number));
+  const rawMaxOffer = Math.max(...outcomeRows.map((record) => record[7] as number));
+  const maxOffer = rawMaxOffer > minOffer ? rawMaxOffer : minOffer + 1;
+  const providerY = 100;
+  const issuerY = 222;
+  const xFor = (amount: number) => padLeft + ((amount - minOffer) / (maxOffer - minOffer)) * chartWidth;
+  const yFor = (record: RecordTuple, index: number) => {
+    const lane = record[10] === 0 ? providerY : issuerY;
+    const jitter = (((index * 37) % 25) - 12) * 1.55;
+    return lane + jitter;
+  };
+  const providerWins = outcomeRows.filter((record) => record[10] === 0).length;
+  const issuerWins = outcomeRows.length - providerWins;
+  const pointRadius = outcomeRows.length > 1800 ? 3 : outcomeRows.length > 700 ? 3.5 : 4.5;
+  const xTicks = Array.from({ length: 5 }, (_, index) => minOffer + ((maxOffer - minOffer) * index) / 4);
+  const hoverRecord = hoverIndex === null ? null : outcomeRows[hoverIndex];
+  const hoverX = hoverRecord ? xFor(hoverRecord[7] as number) : 0;
+  const hoverY = hoverRecord && hoverIndex !== null ? yFor(hoverRecord, hoverIndex) : 0;
+  const tooltipWidth = 336;
+  const tooltipHeight = 198;
+  const tooltipX = hoverX > width - tooltipWidth - 24 ? hoverX - tooltipWidth - 12 : hoverX + 12;
+  const tooltipY = Math.max(8, Math.min(height - tooltipHeight - 8, hoverY - tooltipHeight / 2));
+  const tooltipLines = hoverRecord
+    ? [
+        `${hoverRecord[3]} Q${hoverRecord[4]} | Service year ${hoverRecord[15] ?? 'N/R'} | POS ${data.dictionaries.places[hoverRecord[5]] ?? 'N/R'}`,
+        `Provider offer: ${formatMoney(hoverRecord[7])}`,
+        `QPA: ${formatMoney(hoverRecord[6])} | Plan: ${formatMoney(hoverRecord[8])}`,
+        `Prevailing: ${formatMoney(hoverRecord[9])} | Initial payment: ${formatMoney(hoverRecord[17])}`,
+        `Cost sharing: ${formatMoney(hoverRecord[16])}`,
+        `Region: ${data.dictionaries.regions[hoverRecord[1]] ?? 'N/R'}`,
+        `Entity: ${data.dictionaries.entities[hoverRecord[2]] ?? 'N/R'}`,
+        `Line: ${data.dictionaries.lineTypes[hoverRecord[12]] ?? 'N/R'} | Initiated by: ${data.dictionaries.initiatingParties[hoverRecord[13]] ?? 'N/R'}`,
+        `Modifier: ${data.dictionaries.modifiers[hoverRecord[14]] ?? 'N/R'} | Default: ${data.defaultValues[hoverRecord[11]] ?? 'unknown'}`,
+      ]
+    : [];
 
   return (
-    <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="flex flex-wrap gap-2" role="tablist" aria-label="Reference tabs">
-        <button className={tabClass('place')} type="button" role="tab" aria-selected={activeTab === 'place'} onClick={() => onChange('place')}>
-          Place of service
-        </button>
-        <button className={tabClass('strategy')} type="button" role="tab" aria-selected={activeTab === 'strategy'} onClick={() => onChange('strategy')}>
-          Strategy points
-        </button>
+    <div className="overflow-x-auto rounded-md border border-slate-200 bg-white">
+      <svg
+        className="min-w-[760px]"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label="Historical exact-filter provider and plan wins plotted by provider offer amount"
+        onPointerLeave={() => setHoverIndex(null)}
+      >
+        <rect width={width} height={height} fill="#ffffff" />
+        <rect x={padLeft} y={providerY - 31} width={chartWidth} height="62" fill="#f0fdf4" />
+        <rect x={padLeft} y={issuerY - 31} width={chartWidth} height="62" fill="#fef2f2" />
+        <text x={padLeft - 14} y={providerY + 4} textAnchor="end" className="fill-green-800 text-[12px] font-semibold">
+          Provider won
+        </text>
+        <text x={padLeft - 14} y={issuerY + 4} textAnchor="end" className="fill-red-800 text-[12px] font-semibold">
+          Plan won
+        </text>
+        {xTicks.map((tick, index) => (
+          <g key={`${tick}-${index}`}>
+            <line x1={xFor(tick)} x2={xFor(tick)} y1={padTop} y2={height - padBottom} stroke="#e2e8f0" />
+            <text
+              x={xFor(tick)}
+              y={height - 31}
+              textAnchor={index === 0 ? 'start' : index === xTicks.length - 1 ? 'end' : 'middle'}
+              className="fill-slate-500 text-[11px]"
+            >
+              {formatMoney(tick)}
+            </text>
+          </g>
+        ))}
+        {outcomeRows.map((record, index) => (
+          <circle
+            key={index}
+            cx={xFor(record[7] as number)}
+            cy={yFor(record, index)}
+            r={hoverIndex === index ? pointRadius + 2 : pointRadius}
+            fill={record[10] === 0 ? '#15803d' : '#dc2626'}
+            fillOpacity={hoverIndex === index ? 1 : 0.72}
+            stroke={hoverIndex === index ? '#ffffff' : 'none'}
+            strokeWidth="2"
+            onPointerEnter={() => setHoverIndex(index)}
+            onPointerMove={() => setHoverIndex(index)}
+          />
+        ))}
+        {hoverRecord ? (
+          <g pointerEvents="none">
+            <line x1={hoverX} x2={hoverX} y1={padTop} y2={height - padBottom} stroke="#475569" strokeDasharray="4 4" />
+            <circle cx={hoverX} cy={hoverY} r={pointRadius + 3} fill="none" stroke="#0f172a" strokeWidth="2" />
+            <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} rx="6" fill="#0f172a" />
+            <text x={tooltipX + 12} y={tooltipY + 21} className="fill-white text-[12px] font-semibold">
+              {hoverRecord[10] === 0 ? 'Provider win' : 'Plan win'}
+            </text>
+            {tooltipLines.map((line, index) => (
+              <text key={line} x={tooltipX + 12} y={tooltipY + 42 + index * 17} className="fill-slate-200 text-[11px]">
+                {line.length > 54 ? `${line.slice(0, 53)}...` : line}
+              </text>
+            ))}
+          </g>
+        ) : null}
+        <text x={width / 2} y={height - 8} textAnchor="middle" className="fill-slate-600 text-[12px] font-semibold">
+          Actual provider offer in each reported case
+        </text>
+      </svg>
+      <div className="flex flex-wrap gap-x-5 gap-y-2 border-t border-slate-100 px-4 py-3 text-xs text-slate-600">
+        <span><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-green-700" />{formatNumber(providerWins)} provider wins</span>
+        <span><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-red-600" />{formatNumber(issuerWins)} plan wins</span>
+        <span>{formatNumber(outcomeRows.length)} exact-filter rows with reported offers</span>
       </div>
-
-      {activeTab === 'place' ? (
-        <div className="mt-4 grid gap-4 text-sm leading-6 text-slate-600 lg:grid-cols-[1fr_1.2fr]">
-          <div>
-            <h3 className="text-base font-semibold text-slate-950">What Place of Service Means</h3>
-            <p className="mt-2">
-              Place of service is the two-digit CMS code for the care setting attached to the disputed line item. In this data it helps separate inpatient hospital, outpatient hospital, emergency department, ambulatory surgery center, and unreported settings.
-            </p>
-          </div>
-          <dl className="grid grid-cols-[72px_minmax(0,1fr)] gap-x-3 gap-y-2">
-            <dt className="font-semibold text-slate-800">21</dt>
-            <dd>Inpatient hospital</dd>
-            <dt className="font-semibold text-slate-800">22</dt>
-            <dd>Outpatient hospital</dd>
-            <dt className="font-semibold text-slate-800">23</dt>
-            <dd>Emergency room - hospital</dd>
-            <dt className="font-semibold text-slate-800">24</dt>
-            <dd>Ambulatory surgical center</dd>
-            <dt className="font-semibold text-slate-800">N/R</dt>
-            <dd>Not reported in the source row</dd>
-          </dl>
-        </div>
-      ) : (
-        <div className="mt-4 grid gap-4 text-sm leading-6 text-slate-600 lg:grid-cols-2">
-          <div>
-            <h3 className="text-base font-semibold text-slate-950">What Strategy Points Represent</h3>
-            <p className="mt-2">
-              The model estimates win probability from comparable historical provider-offer-to-QPA ratios. Expected value is estimated as provider offer times win probability, plus the median issuer offer times loss probability.
-            </p>
-          </div>
-          <dl className="grid grid-cols-[120px_minmax(0,1fr)] gap-x-3 gap-y-2">
-            <dt className="font-semibold text-slate-800">Conservative</dt>
-            <dd>Highest expected payment that clears at least an 80% estimated win chance, or your selected floor if it is higher.</dd>
-            <dt className="font-semibold text-slate-800">Balanced</dt>
-            <dd>The main recommended offer: highest expected payment that clears the win-probability floor you set.</dd>
-            <dt className="font-semibold text-slate-800">Aggressive</dt>
-            <dd>Highest expected payment with minimal risk constraint. It can be more profitable on paper but usually has a lower estimated win chance.</dd>
-            <dt className="font-semibold text-slate-800">Slider</dt>
-            <dd>Your current proposed offer amount and the model&apos;s interpolated probability/expected value for that amount.</dd>
-          </dl>
-        </div>
-      )}
-    </section>
+    </div>
   );
 }
 
-function OfferCurve({ model, riskFloor }: { model: ModelResult | null; riskFloor: number }) {
+function OfferCurve({
+  model,
+  riskFloor,
+  selectedPoint,
+  onSelectAmount,
+  axisMax,
+  showExtrapolation,
+  onAxisMaxChange,
+}: {
+  model: ModelResult | null;
+  riskFloor: number;
+  selectedPoint: ModelPoint | null;
+  onSelectAmount: (amount: number) => void;
+  axisMax: number;
+  showExtrapolation: boolean;
+  onAxisMaxChange: (amount: number) => void;
+}) {
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const [editingAxisMax, setEditingAxisMax] = useState(false);
+  const [axisDraft, setAxisDraft] = useState('');
+
   if (!model || !model.points.length) {
     return (
       <div className="flex h-72 items-center justify-center rounded-md border border-slate-200 bg-slate-50 text-sm text-slate-500">
@@ -613,25 +748,76 @@ function OfferCurve({ model, riskFloor }: { model: ModelResult | null; riskFloor
     );
   }
 
-  const width = 720;
-  const height = 280;
-  const padLeft = 58;
-  const padRight = 22;
-  const padTop = 18;
-  const padBottom = 42;
+  const width = 920;
+  const height = 360;
+  const padLeft = 64;
+  const padRight = 28;
+  const padTop = 24;
+  const padBottom = 54;
   const chartWidth = width - padLeft - padRight;
   const chartHeight = height - padTop - padBottom;
-  const minAmount = model.points[0].amount;
-  const maxAmount = model.points[model.points.length - 1].amount;
-  const xFor = (amount: number) => padLeft + ((amount - minAmount) / Math.max(1, maxAmount - minAmount)) * chartWidth;
+  const minAmount = model.amountMin;
+  const maxAmount = Math.max(minAmount + 1, axisMax);
+  const xFor = (amount: number) => padLeft + ((amount - minAmount) / (maxAmount - minAmount)) * chartWidth;
   const yFor = (probability: number) => padTop + (1 - probability) * chartHeight;
-  const line = model.points.map((point) => `${xFor(point.amount)},${yFor(point.winProbability)}`).join(' ');
-  const selected = model.selected;
+  const visiblePoints = model.points.filter((point) => point.amount <= maxAmount);
+  const endpoint = interpolatePoint(model.points, maxAmount);
+  if (endpoint && !visiblePoints.some((point) => point.amount === maxAmount)) visiblePoints.push(endpoint);
+  visiblePoints.sort((a, b) => a.amount - b.amount);
+  const supportedPoints = visiblePoints.filter((point) => !point.extrapolated);
+  const extrapolatedPoints = showExtrapolation ? visiblePoints.filter((point) => point.extrapolated) : [];
+  const boundaryPoint = supportedPoints.at(-1);
+  const solidLine = supportedPoints.map((point) => `${xFor(point.amount)},${yFor(point.winProbability)}`).join(' ');
+  const dashedLine = [boundaryPoint, ...extrapolatedPoints]
+    .filter((point): point is ModelPoint => Boolean(point))
+    .map((point) => `${xFor(point.amount)},${yFor(point.winProbability)}`)
+    .join(' ');
+  const hoverPoint = hoverIndex === null ? null : visiblePoints[hoverIndex];
+  const focusPoint = hoverPoint ?? (selectedPoint && selectedPoint.amount <= maxAmount ? selectedPoint : null);
   const riskY = yFor(riskFloor);
+  const xTicks = Array.from({ length: 5 }, (_, index) => minAmount + ((maxAmount - minAmount) * index) / 4);
+
+  function updateHover(clientX: number, bounds: DOMRect) {
+    const svgX = ((clientX - bounds.left) / bounds.width) * width;
+    const position = Math.min(1, Math.max(0, (svgX - padLeft) / chartWidth));
+    const amount = minAmount + position * (maxAmount - minAmount);
+    let closestIndex = 0;
+    let closestDistance = Number.POSITIVE_INFINITY;
+    visiblePoints.forEach((point, index) => {
+      const distance = Math.abs(point.amount - amount);
+      if (distance < closestDistance) {
+        closestDistance = distance;
+        closestIndex = index;
+      }
+    });
+    setHoverIndex(closestIndex);
+  }
+
+  const tooltipX = focusPoint ? xFor(focusPoint.amount) : 0;
+  const tooltipY = focusPoint ? yFor(focusPoint.winProbability) : 0;
+  const tooltipLeft = tooltipX > width - 230 ? tooltipX - 176 : tooltipX + 14;
+  const tooltipTop = Math.max(10, Math.min(height - 92, tooltipY - 68));
+
+  function commitAxisMax() {
+    const parsed = Number(axisDraft.replace(/[$,\s]/g, ''));
+    if (Number.isFinite(parsed) && parsed > minAmount) onAxisMaxChange(parsed);
+    setEditingAxisMax(false);
+  }
 
   return (
     <div className="overflow-x-auto rounded-md border border-slate-200 bg-white">
-      <svg className="min-w-[720px]" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Estimated provider win probability by proposed offer amount">
+      <svg
+        className="min-w-[760px] touch-none"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label="Estimated provider win probability by proposed offer amount on a linear dollar axis"
+        onPointerMove={(event) => updateHover(event.clientX, event.currentTarget.getBoundingClientRect())}
+        onPointerLeave={() => setHoverIndex(null)}
+        onPointerDown={(event) => updateHover(event.clientX, event.currentTarget.getBoundingClientRect())}
+        onClick={() => {
+          if (hoverPoint) onSelectAmount(hoverPoint.amount);
+        }}
+      >
         <rect x="0" y="0" width={width} height={height} fill="#ffffff" />
         {[0, 0.25, 0.5, 0.75, 1].map((tick) => (
           <g key={tick}>
@@ -641,22 +827,105 @@ function OfferCurve({ model, riskFloor }: { model: ModelResult | null; riskFloor
             </text>
           </g>
         ))}
+        {showExtrapolation && maxAmount > model.evidenceAmountMax ? (
+          <rect
+            x={xFor(model.evidenceAmountMax)}
+            y={padTop}
+            width={Math.max(0, width - padRight - xFor(model.evidenceAmountMax))}
+            height={chartHeight}
+            fill="#f8fafc"
+          />
+        ) : null}
         <line x1={padLeft} x2={width - padRight} y1={riskY} y2={riskY} stroke="#d97706" strokeDasharray="5 5" />
-        <polyline points={line} fill="none" stroke="#0f766e" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-        {selected ? (
+        <text x={width - padRight} y={riskY - 7} textAnchor="end" className="fill-amber-700 text-[11px] font-semibold">
+          {formatPercent(riskFloor)} floor
+        </text>
+        {showExtrapolation && maxAmount > model.evidenceAmountMax ? (
+          <>
+            <line
+              x1={xFor(model.evidenceAmountMax)}
+              x2={xFor(model.evidenceAmountMax)}
+              y1={padTop}
+              y2={height - padBottom}
+              stroke="#94a3b8"
+              strokeDasharray="3 5"
+            />
+            <text
+              x={Math.min(width - padRight - 4, xFor(model.evidenceAmountMax) + 8)}
+              y={padTop + 14}
+              className="fill-slate-500 text-[11px] font-semibold"
+            >
+              Extrapolated
+            </text>
+          </>
+        ) : null}
+        <polyline points={solidLine} fill="none" stroke="#0f766e" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        <polyline
+          points={dashedLine}
+          fill="none"
+          stroke="#0f766e"
+          strokeWidth="3"
+          strokeDasharray="7 7"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        {focusPoint ? (
           <g>
-            <line x1={xFor(selected.amount)} x2={xFor(selected.amount)} y1={padTop} y2={height - padBottom} stroke="#64748b" strokeDasharray="4 4" />
-            <circle cx={xFor(selected.amount)} cy={yFor(selected.winProbability)} r="6" fill="#0f766e" stroke="#ffffff" strokeWidth="2" />
+            <line x1={tooltipX} x2={tooltipX} y1={padTop} y2={height - padBottom} stroke="#64748b" strokeDasharray="4 4" />
+            <circle cx={tooltipX} cy={tooltipY} r="6" fill="#0f766e" stroke="#ffffff" strokeWidth="2" />
+            <rect x={tooltipLeft} y={tooltipTop} width="164" height="58" rx="6" fill="#0f172a" />
+            <text x={tooltipLeft + 12} y={tooltipTop + 22} className="fill-white text-[13px] font-semibold">
+              {formatMoney(focusPoint.amount)}
+            </text>
+            <text x={tooltipLeft + 12} y={tooltipTop + 43} className="fill-slate-200 text-[12px]">
+              {formatPercent(focusPoint.winProbability, 1)} estimated win rate
+            </text>
           </g>
         ) : null}
-        <text x={padLeft} y={height - 14} className="fill-slate-500 text-[11px]">
-          {formatMoney(minAmount)}
-        </text>
-        <text x={width - padRight} y={height - 14} textAnchor="end" className="fill-slate-500 text-[11px]">
-          {formatMoney(maxAmount)}
-        </text>
-        <text x={width / 2} y={height - 14} textAnchor="middle" className="fill-slate-600 text-[12px] font-semibold">
-          Proposed provider offer
+        {xTicks.map((tick, index) =>
+          editingAxisMax && index === xTicks.length - 1 ? (
+            <foreignObject key="axis-editor" x={width - padRight - 116} y={height - 48} width="116" height="34">
+              <input
+                autoFocus
+                value={axisDraft}
+                aria-label="Offer curve maximum amount"
+                onChange={(event) => setAxisDraft(event.target.value)}
+                onBlur={commitAxisMax}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => event.stopPropagation()}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') commitAxisMax();
+                  if (event.key === 'Escape') setEditingAxisMax(false);
+                }}
+                className="h-7 w-full rounded border border-teal-600 bg-white px-2 text-right text-[11px] text-slate-800 outline-none ring-2 ring-teal-100"
+              />
+            </foreignObject>
+          ) : (
+            <text
+              key={`${tick}-${index}`}
+              x={xFor(tick)}
+              y={height - 28}
+              textAnchor={index === 0 ? 'start' : index === xTicks.length - 1 ? 'end' : 'middle'}
+              className={index === xTicks.length - 1 ? 'cursor-text fill-slate-700 text-[11px] font-semibold' : 'fill-slate-500 text-[11px]'}
+              onPointerDown={index === xTicks.length - 1 ? (event) => event.stopPropagation() : undefined}
+              onClick={index === xTicks.length - 1 ? (event) => event.stopPropagation() : undefined}
+              onDoubleClick={
+                index === xTicks.length - 1
+                  ? (event) => {
+                      event.stopPropagation();
+                      setAxisDraft(String(Math.round(maxAmount)));
+                      setEditingAxisMax(true);
+                    }
+                  : undefined
+              }
+            >
+              {index === xTicks.length - 1 ? <title>Double-click to edit the axis maximum</title> : null}
+              {formatMoney(tick)}
+            </text>
+          ),
+        )}
+        <text x={width / 2} y={height - 8} textAnchor="middle" className="fill-slate-600 text-[12px] font-semibold">
+          Proposed provider offer (linear scale)
         </text>
       </svg>
     </div>
@@ -667,6 +936,7 @@ export default function IdrConsole() {
   const [data, setData] = useState<IdrData | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [codeInput, setCodeInput] = useState(DEFAULT_CODE);
+  const [selectedState, setSelectedState] = useState(ALL);
   const [selectedRegion, setSelectedRegion] = useState(ALL);
   const [selectedEntity, setSelectedEntity] = useState(ALL);
   const [selectedPlace, setSelectedPlace] = useState(ALL);
@@ -674,7 +944,10 @@ export default function IdrConsole() {
   const [entityOnlyPeriods, setEntityOnlyPeriods] = useState(false);
   const [riskFloorPct, setRiskFloorPct] = useState(70);
   const [offerAmount, setOfferAmount] = useState<number | null>(null);
-  const [infoTab, setInfoTab] = useState<'place' | 'strategy'>('place');
+  const [showExtrapolation, setShowExtrapolation] = useState(false);
+  const [axisMaxOverride, setAxisMaxOverride] = useState<number | null>(null);
+  const [hasStarted, setHasStarted] = useState(false);
+  const [activePage, setActivePage] = useState<ResultsPage>('strategy');
 
   useEffect(() => {
     let cancelled = false;
@@ -729,14 +1002,38 @@ export default function IdrConsole() {
 
   const regionOptions = useMemo(() => {
     if (!data) return [];
-    return uniqueSorted(data.dictionaries.regions);
+    return uniqueSorted(data.dictionaries.regions.filter((region) => !UNKNOWN_REGIONS.has(region)));
   }, [data]);
-  const activeRegion = selectedRegion !== ALL && regionOptions.includes(selectedRegion) ? selectedRegion : ALL;
+
+  const regionsByState = useMemo(() => {
+    const map = new Map<string, string[]>();
+    regionOptions.forEach((region) => {
+      regionStates(region).forEach((state) => {
+        if (!map.has(state)) map.set(state, []);
+        map.get(state)?.push(region);
+      });
+    });
+    map.forEach((regions, state) => map.set(state, uniqueSorted(regions)));
+    return map;
+  }, [regionOptions]);
+
+  const stateOptions = useMemo(
+    () => Array.from(regionsByState.keys()).sort((a, b) => STATE_NAMES[a].localeCompare(STATE_NAMES[b])),
+    [regionsByState],
+  );
+  const activeState = selectedState !== ALL && regionsByState.has(selectedState) ? selectedState : ALL;
+  const cityRegionOptions = activeState === ALL ? regionOptions : regionsByState.get(activeState) ?? [];
+  const activeRegion = selectedRegion !== ALL && cityRegionOptions.includes(selectedRegion) ? selectedRegion : ALL;
+
+  const stateRecords = useMemo(() => {
+    if (!data || activeState === ALL) return yearRecords;
+    return yearRecords.filter((record) => regionStates(data.dictionaries.regions[record[1]]).includes(activeState));
+  }, [activeState, data, yearRecords]);
 
   const regionRecords = useMemo(() => {
-    if (!data || activeRegion === ALL) return yearRecords;
-    return yearRecords.filter((record) => data.dictionaries.regions[record[1]] === activeRegion);
-  }, [activeRegion, data, yearRecords]);
+    if (!data || activeRegion === ALL) return stateRecords;
+    return stateRecords.filter((record) => data.dictionaries.regions[record[1]] === activeRegion);
+  }, [activeRegion, data, stateRecords]);
 
   const entityOptions = useMemo(() => {
     if (!data) return [];
@@ -774,56 +1071,78 @@ export default function IdrConsole() {
   const modelScopes = useMemo(() => {
     const scopes: { label: string; records: RecordTuple[] }[] = [];
     const exactLabels = [
-      activeRegion === ALL ? 'all geographies' : activeRegion,
+      activeRegion !== ALL ? activeRegion : activeState !== ALL ? STATE_NAMES[activeState] : 'all geographies',
       activeEntity === ALL ? 'all entities' : activeEntity,
       activePlace === ALL ? 'all places' : `POS ${activePlace}`,
     ];
     scopes.push({ label: `exact filters (${exactLabels.join(', ')})`, records: exactRecords });
     if (activePlace !== ALL) scopes.push({ label: 'selected code, geography, and entity across places', records: entityRecords });
     if (activeEntity !== ALL) scopes.push({ label: 'selected code and geography across entities', records: regionRecords });
-    if (activeRegion !== ALL) scopes.push({ label: 'selected code across geographies', records: yearRecords });
+    if (activeRegion !== ALL) scopes.push({ label: 'selected code across regions in the selected state', records: stateRecords });
+    if (activeState !== ALL) scopes.push({ label: 'selected code across all geographies', records: yearRecords });
     scopes.push({ label: 'same procedure family across selected years', records: procedureRecords });
     return scopes.filter((scope, index, array) => scope.records.length && array.findIndex((item) => item.records === scope.records) === index);
   }, [
     activeEntity,
     activePlace,
     activeRegion,
+    activeState,
     entityRecords,
     exactRecords,
     procedureRecords,
     regionRecords,
+    stateRecords,
     yearRecords,
   ]);
 
   const riskFloor = riskFloorPct / 100;
-  const model = useMemo(() => buildModel(modelScopes, riskFloor, null), [modelScopes, riskFloor]);
+  const selectedCohortOffers = useMemo(
+    () =>
+      exactRecords
+        .filter(
+          (record) =>
+            (record[10] === 0 || record[10] === 1) &&
+            isFiniteNumber(record[7]) &&
+            record[7] > 0,
+        )
+        .map((record) => record[7] as number),
+    [exactRecords],
+  );
+  const model = useMemo(
+    () => buildModel(modelScopes, riskFloor, selectedCohortOffers),
+    [modelScopes, riskFloor, selectedCohortOffers],
+  );
+  const offerAxisLimit = model ? (showExtrapolation ? model.amountMax : model.evidenceAmountMax) : 1;
+  const offerAxisMax = model
+    ? Math.max(model.amountMin + 1, Math.min(axisMaxOverride ?? offerAxisLimit, offerAxisLimit))
+    : 1;
   const displayedOfferAmount = useMemo(() => {
     if (!model) return offerAmount;
-    const fallback = model.recommended?.amount ?? model.amountMin;
+    const fallback = model.recommended?.amount ?? model.aggressive?.amount ?? model.amountMin;
     const rawAmount = offerAmount ?? fallback;
-    return Math.min(model.amountMax, Math.max(model.amountMin, rawAmount));
-  }, [model, offerAmount]);
+    return Math.min(offerAxisMax, Math.max(model.amountMin, rawAmount));
+  }, [model, offerAmount, offerAxisMax]);
 
-  const selectedModelPoint = displayedOfferAmount && model ? interpolatePoint(model.points, displayedOfferAmount) : model?.selected ?? null;
+  const selectedModelPoint = displayedOfferAmount && model ? interpolatePoint(model.points, displayedOfferAmount) : null;
 
   const yearSegments = useMemo(() => groupSegments(exactRecords, (record) => `${record[3]} Q${record[4]}`, 12), [exactRecords]);
   const entitySegments = useMemo(
     () =>
       groupSegments(
-        activeRegion === ALL ? yearRecords : regionRecords,
+        activeRegion === ALL ? stateRecords : regionRecords,
         (record) => data?.dictionaries.entities[record[2]] ?? 'N/R',
         10,
       ),
-    [activeRegion, data, regionRecords, yearRecords],
+    [activeRegion, data, regionRecords, stateRecords],
   );
   const geographySegments = useMemo(
     () =>
       groupSegments(
-        activeEntity === ALL ? yearRecords : entityRecords,
+        activeEntity === ALL ? stateRecords : entityRecords,
         (record) => data?.dictionaries.regions[record[1]] ?? 'N/R',
         10,
       ),
-    [activeEntity, data, entityRecords, yearRecords],
+    [activeEntity, data, entityRecords, stateRecords],
   );
   const placeSegments = useMemo(
     () => groupSegments(exactRecords, (record) => `POS ${data?.dictionaries.places[record[5]] ?? 'N/R'}`, 8),
@@ -854,6 +1173,14 @@ export default function IdrConsole() {
     });
   }
 
+  function changeAxisMax(amount: number) {
+    if (!model) return;
+    const limit = showExtrapolation ? model.amountMax : model.evidenceAmountMax;
+    const next = Math.max(model.amountMin + 1, Math.min(limit, amount));
+    setAxisMaxOverride(next);
+    setOfferAmount((current) => (current === null ? current : Math.min(current, next)));
+  }
+
   if (loadError) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-[#f7f8f4] p-6 text-slate-950">
@@ -876,24 +1203,217 @@ export default function IdrConsole() {
     );
   }
 
-  return (
-    <main className="min-h-screen bg-[#f7f8f4] text-slate-950">
-      <div className="mx-auto flex w-full max-w-[1540px] flex-col gap-4 px-4 py-4 sm:px-6 lg:px-8">
-        <header className="flex flex-wrap items-end justify-between gap-4 border-b border-slate-200 pb-4">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-teal-700">Federal IDR offer console</p>
-            <h1 className="mt-1 text-2xl font-semibold tracking-tight sm:text-3xl">Out-of-network arbitration strategy</h1>
-            <p className="mt-2 max-w-4xl text-sm leading-6 text-slate-600">
-              Built from the local CMS Federal IDR public use files for 2023, 2024, and 2025 plus the local billing-code mapping. The NYTimes article frames the incentive problem; this tool keeps the analysis empirical and source-limited.
-            </p>
-          </div>
-          <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm leading-5 text-amber-950">
-            Decision support only. It cannot know the payer&apos;s final submission or replace legal, coding, or valuation advice.
+  const inputClass =
+    'mt-2 h-11 w-full rounded-md border border-slate-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100';
+
+  const navItems: { id: ResultsPage; label: string; icon: typeof Calculator }[] = [
+    { id: 'strategy', label: 'Strategy', icon: Calculator },
+    { id: 'outcomes', label: 'Outcomes', icon: BarChart3 },
+    { id: 'breakdowns', label: 'Breakdowns', icon: Database },
+    { id: 'comparables', label: 'Comparable rows', icon: FileSearch },
+    { id: 'guide', label: 'Guide', icon: BookOpen },
+  ];
+
+  if (!hasStarted) {
+    return (
+      <main className="flex min-h-screen flex-col bg-[#f4f6f5] text-slate-950">
+        <header className="border-b border-slate-200 bg-white">
+          <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-4 sm:px-8">
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-md bg-teal-800 text-white">
+                <Calculator size={19} aria-hidden="true" />
+              </div>
+              <div>
+                <p className="font-semibold text-slate-950">Federal IDR Offer Console</p>
+                <p className="text-xs text-slate-500">Out-of-network arbitration decision support</p>
+              </div>
+            </div>
+            <span className="hidden rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600 sm:inline">
+              CMS PUF 2023-2025
+            </span>
           </div>
         </header>
 
-        <section className="grid gap-4 xl:grid-cols-[380px_minmax(0,1fr)]">
-          <aside className="space-y-4">
+        <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-5 py-10 sm:px-8 sm:py-14">
+          <div className="max-w-3xl">
+            <p className="text-sm font-semibold text-teal-700">New analysis</p>
+            <h1 className="mt-2 text-3xl font-semibold text-slate-950 sm:text-4xl">Build an arbitration scenario</h1>
+            <p className="mt-3 text-base leading-7 text-slate-600">
+              Choose the procedure, market, assigned IDR entity, care setting, and source period. The results separate offer strategy from the underlying outcome data.
+            </p>
+          </div>
+
+          <section className="mt-8 rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
+            <div className="grid gap-x-6 gap-y-6 lg:grid-cols-2">
+              <div className="lg:col-span-2">
+                <label className="text-sm font-semibold text-slate-800" htmlFor="code">CPT or billing code</label>
+                <input
+                  id="code"
+                  list="code-options"
+                  value={codeInput}
+                  onChange={(event) => setCodeInput(event.target.value)}
+                  onBlur={() => setCodeInput(normalizeCode(codeInput))}
+                  className={`${inputClass} text-base`}
+                  placeholder="63047"
+                />
+                <datalist id="code-options">
+                  {data.dictionaries.codes.map((code) => (
+                    <option key={code.code} value={code.code}>{code.description}</option>
+                  ))}
+                </datalist>
+                {selectedCodeInfo ? (
+                  <p className="mt-2 text-sm leading-5 text-slate-600">
+                    <span className="font-semibold text-slate-800">{selectedCodeInfo.procedureTitle || 'Procedure'}:</span>{' '}
+                    {selectedCodeInfo.description}
+                  </p>
+                ) : (
+                  <p className="mt-2 text-sm text-red-700">No local IDR records were found for this code.</p>
+                )}
+              </div>
+
+              <div>
+                <label className="text-sm font-semibold text-slate-800" htmlFor="state">State</label>
+                <select
+                  id="state"
+                  value={activeState}
+                  onChange={(event) => {
+                    setSelectedState(event.target.value);
+                    setSelectedRegion(ALL);
+                  }}
+                  className={inputClass}
+                >
+                  <option value={ALL}>All states</option>
+                  {stateOptions.map((state) => <option key={state} value={state}>{STATE_NAMES[state]}</option>)}
+                </select>
+              </div>
+
+              <div>
+                <label className="text-sm font-semibold text-slate-800" htmlFor="region">City or market region</label>
+                <select id="region" value={activeRegion} onChange={(event) => setSelectedRegion(event.target.value)} className={inputClass}>
+                  <option value={ALL}>{activeState === ALL ? 'All geographies' : `All ${STATE_NAMES[activeState]} regions`}</option>
+                  {cityRegionOptions.map((region) => <option key={region} value={region}>{regionDisplayName(region)}</option>)}
+                </select>
+                <p className="mt-2 text-xs leading-5 text-slate-500">Multi-state CMS regions appear under every state named in the region.</p>
+              </div>
+
+              <div>
+                <label className="text-sm font-semibold text-slate-800" htmlFor="entity">Certified IDR entity</label>
+                <select id="entity" value={activeEntity} onChange={(event) => setSelectedEntity(event.target.value)} className={inputClass}>
+                  <option value={ALL}>All entities</option>
+                  {entityOptions.map((entity) => <option key={entity} value={entity}>{entity}</option>)}
+                </select>
+              </div>
+
+              <div>
+                <label className="text-sm font-semibold text-slate-800" htmlFor="place">Place of service</label>
+                <select id="place" value={activePlace} onChange={(event) => setSelectedPlace(event.target.value)} className={inputClass}>
+                  <option value={ALL}>All places of service</option>
+                  {placeOptions.map((place) => <option key={place} value={place}>POS {place}</option>)}
+                </select>
+              </div>
+
+              <fieldset className="lg:col-span-2">
+                <legend className="text-sm font-semibold text-slate-800">Data years</legend>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {DEFAULT_YEARS.map((year) => (
+                    <label key={year} className={`flex h-10 min-w-24 items-center justify-center gap-2 rounded-md border border-slate-300 bg-slate-50 px-4 text-sm font-medium ${entityOnlyPeriods ? 'opacity-45' : ''}`}>
+                      <input type="checkbox" checked={selectedYears.has(year)} disabled={entityOnlyPeriods} onChange={() => toggleYear(year)} />
+                      {year}
+                    </label>
+                  ))}
+                </div>
+                <label className="mt-3 flex max-w-3xl items-start gap-3 rounded-md border border-teal-200 bg-teal-50 px-3 py-3 text-sm leading-5 text-teal-950">
+                  <input className="mt-1" type="checkbox" checked={entityOnlyPeriods} onChange={(event) => setEntityOnlyPeriods(event.target.checked)} />
+                  <span><span className="font-semibold">Entity-labeled data only: 2025 Q3 and Q4.</span> The certified IDR entity field begins in 2025 Q3 in the local CMS files.</span>
+                </label>
+              </fieldset>
+            </div>
+
+            <div className="mt-7 flex flex-wrap items-center justify-between gap-4 border-t border-slate-200 pt-5">
+              <p className="max-w-2xl text-xs leading-5 text-slate-500">Decision support only. The model cannot observe the payer&apos;s final offer and does not replace legal, coding, or valuation advice.</p>
+              <button
+                type="button"
+                disabled={!selectedCodeInfo}
+                onClick={() => {
+                  setOfferAmount(null);
+                  setShowExtrapolation(false);
+                  setAxisMaxOverride(null);
+                  setActivePage('strategy');
+                  setHasStarted(true);
+                  window.scrollTo({ top: 0, behavior: 'smooth' });
+                }}
+                className="inline-flex h-11 items-center gap-2 rounded-md bg-teal-800 px-5 text-sm font-semibold text-white transition hover:bg-teal-900 disabled:cursor-not-allowed disabled:opacity-45"
+              >
+                Analyze scenario
+                <Check size={17} aria-hidden="true" />
+              </button>
+            </div>
+          </section>
+        </div>
+
+        <footer className="px-5 pb-6 text-center text-xs text-slate-400">Made by Devin Kancherla</footer>
+      </main>
+    );
+  }
+
+  return (
+    <main className="min-h-screen bg-[#f4f6f5] text-slate-950">
+      <header className="border-b border-slate-200 bg-white">
+        <div className="mx-auto flex w-full max-w-[1480px] flex-wrap items-center justify-between gap-4 px-4 py-4 sm:px-7">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-md bg-teal-800 text-white">
+              <Calculator size={19} aria-hidden="true" />
+            </div>
+            <div>
+              <p className="font-semibold">Federal IDR Offer Console</p>
+              <p className="text-xs text-slate-500">CPT {normalizedCode} analysis</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setHasStarted(false)}
+            className="inline-flex h-10 items-center gap-2 rounded-md border border-slate-300 bg-white px-4 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+          >
+            <ArrowLeft size={16} aria-hidden="true" />
+            Edit inputs
+          </button>
+        </div>
+      </header>
+
+      <section className="border-b border-slate-200 bg-slate-950 text-white">
+        <div className="mx-auto grid w-full max-w-[1480px] gap-4 px-4 py-5 sm:px-7 lg:grid-cols-[0.9fr_1.2fr_1fr_0.7fr]">
+          <div><p className="text-xs font-semibold uppercase text-slate-400">Procedure</p><p className="mt-1 text-sm font-semibold">{normalizedCode} - {selectedCodeInfo?.procedureTitle}</p></div>
+          <div><p className="text-xs font-semibold uppercase text-slate-400">Geography</p><p className="mt-1 text-sm font-semibold">{activeRegion !== ALL ? regionDisplayName(activeRegion) : activeState !== ALL ? `All ${STATE_NAMES[activeState]} regions` : 'All geographies'}</p></div>
+          <div><p className="text-xs font-semibold uppercase text-slate-400">IDR entity</p><p className="mt-1 text-sm font-semibold">{activeEntity === ALL ? 'All entities' : activeEntity}</p></div>
+          <div><p className="text-xs font-semibold uppercase text-slate-400">Period / POS</p><p className="mt-1 text-sm font-semibold">{selectedPeriodLabel} / {activePlace === ALL ? 'All POS' : `POS ${activePlace}`}</p></div>
+        </div>
+      </section>
+
+      <nav className="border-b border-slate-200 bg-white" aria-label="Analysis views">
+        <div className="mx-auto flex w-full max-w-[1480px] gap-1 overflow-x-auto px-4 sm:px-7" role="tablist">
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            const active = activePage === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                onClick={() => setActivePage(item.id)}
+                className={`flex h-13 shrink-0 items-center gap-2 border-b-2 px-3 text-sm font-semibold transition ${active ? 'border-teal-700 text-teal-800' : 'border-transparent text-slate-500 hover:text-slate-800'}`}
+              >
+                <Icon size={16} aria-hidden="true" />
+                {item.label}
+              </button>
+            );
+          })}
+        </div>
+      </nav>
+
+      <div className="mx-auto w-full max-w-[1480px] px-4 py-6 sm:px-7 sm:py-8">
+        <section className="block">
+          <aside className="hidden">
             <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
               <div className="grid gap-4">
                 <div>
@@ -1069,12 +1589,12 @@ export default function IdrConsole() {
             </section>
           </aside>
 
-          <section className="space-y-4">
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <section className="min-w-0 space-y-6">
+            <div className={activePage === 'strategy' ? 'grid gap-4 md:grid-cols-2 xl:grid-cols-4' : 'hidden'}>
               <Metric
                 label="Recommended offer"
                 value={formatMoney(model?.recommended?.amount)}
-                helper={model?.recommended ? `${formatPercent(model.recommended.winProbability)} estimated win chance` : 'Not enough comparable numeric rows'}
+                helper={model?.recommended ? `${formatPercent(model.recommended.winProbability)} estimated win chance` : `No supported offer clears the ${riskFloorPct}% floor`}
                 tone="accent"
               />
               <Metric
@@ -1094,37 +1614,136 @@ export default function IdrConsole() {
               />
             </div>
 
-            <section className="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_360px]">
-              <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+            <section className={activePage === 'strategy' ? 'min-w-0 rounded-lg border border-slate-200 bg-white p-4 shadow-sm' : 'hidden'}>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-semibold">Historical case outcomes</h2>
+                  <p className="mt-1 text-sm leading-5 text-slate-500">Every reported provider or plan win in the exact selected cohort, positioned by the actual provider offer.</p>
+                </div>
+                <p className="text-sm text-slate-500">Hover or tap a dot for case details</p>
+              </div>
+              <div className="mt-4">
+                <OutcomeCasePlot records={exactRecords} data={data} />
+              </div>
+            </section>
+
+            <section className={activePage === 'strategy' ? 'grid min-w-0 gap-4 xl:grid-cols-[280px_minmax(0,1fr)]' : 'hidden'}>
+              <div className="min-w-0 rounded-lg border border-slate-200 bg-white p-5">
+                <div className="flex items-center gap-2">
+                  <SlidersHorizontal size={17} className="text-teal-700" aria-hidden="true" />
+                  <h2 className="font-semibold">Offer controls</h2>
+                </div>
+                <label className="mt-5 block text-sm font-semibold text-slate-800" htmlFor="result-risk">
+                  Minimum win probability
+                </label>
+                <input
+                  id="result-risk"
+                  type="range"
+                  min="35"
+                  max="95"
+                  step="1"
+                  value={riskFloorPct}
+                  onChange={(event) => setRiskFloorPct(Number(event.target.value))}
+                  className="mt-3 w-full accent-teal-700"
+                />
+                <div className="mt-2 flex justify-between text-sm">
+                  <span className="font-semibold">{riskFloorPct}%</span>
+                  <span className="text-slate-500">recommendation floor</span>
+                </div>
+
+                <label className="mt-6 block text-sm font-semibold text-slate-800" htmlFor="result-offer">
+                  Proposed provider offer
+                </label>
+                <input
+                  id="result-offer"
+                  type="range"
+                  min={model?.amountMin ?? 0}
+                  max={offerAxisMax}
+                  step="any"
+                  value={displayedOfferAmount ?? 0}
+                  disabled={!model}
+                  onChange={(event) => {
+                    const next = roundOffer(Number(event.target.value));
+                    setOfferAmount(model ? Math.min(offerAxisMax, Math.max(model.amountMin, next)) : next);
+                  }}
+                  className="mt-3 w-full accent-teal-700 disabled:opacity-50"
+                />
+                <p className="mt-3 text-2xl font-semibold">{formatMoney(displayedOfferAmount)}</p>
+                <p className="mt-1 text-sm text-slate-500">
+                  {selectedModelPoint ? `${formatPercent(selectedModelPoint.winProbability, 1)} estimated win chance` : 'Insufficient model data'}
+                </p>
+                {selectedModelPoint?.extrapolated ? (
+                  <div className="mt-4 flex gap-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-950">
+                    <Info size={16} className="mt-0.5 shrink-0" aria-hidden="true" />
+                    This amount is beyond the historical support boundary and is not eligible for recommendation.
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="min-w-0 rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <h2 className="text-lg font-semibold">Offer curve</h2>
-                    <p className="mt-1 text-sm leading-5 text-slate-500">
-                      Model scope: {model?.scope ?? 'none'}{model?.usedDefaults ? '; defaults included due to sparse contested data' : ''}
-                    </p>
+                    <p className="mt-1 text-sm leading-5 text-slate-500">Hover or tap for amount and win rate. Select the curve to move the slider.</p>
                   </div>
-                  <div className="text-right text-sm leading-5 text-slate-500">
-                    <p>Model rows: {formatNumber(model?.modelRows)}</p>
-                    <p>Base win rate: {formatPercent(model?.baseWinRate)}</p>
+                  <div className="flex items-start gap-5">
+                    <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={showExtrapolation}
+                        onChange={(event) => {
+                          const checked = event.target.checked;
+                          setShowExtrapolation(checked);
+                          setAxisMaxOverride(null);
+                          if (!checked && model) {
+                            setOfferAmount((current) =>
+                              current === null ? current : Math.min(current, model.evidenceAmountMax),
+                            );
+                          }
+                        }}
+                        className="h-4 w-4 accent-teal-700"
+                      />
+                      Show extrapolation
+                    </label>
+                    <div className="text-right text-sm leading-5 text-slate-500">
+                      <p>Model rows: {formatNumber(model?.modelRows)}</p>
+                      <p>Base win rate: {formatPercent(model?.baseWinRate)}</p>
+                    </div>
                   </div>
                 </div>
                 <div className="mt-4">
-                  <OfferCurve model={model} riskFloor={riskFloor} />
+                  <OfferCurve
+                    model={model}
+                    riskFloor={riskFloor}
+                    selectedPoint={selectedModelPoint}
+                    onSelectAmount={setOfferAmount}
+                    axisMax={offerAxisMax}
+                    showExtrapolation={showExtrapolation}
+                    onAxisMaxChange={changeAxisMax}
+                  />
+                </div>
+                <div className="mt-3 flex flex-wrap gap-x-6 gap-y-2 text-xs text-slate-500">
+                  <span><span className="mr-2 inline-block h-0.5 w-6 align-middle bg-teal-700" />Historical winning-offer support</span>
+                  {showExtrapolation ? <span><span className="mr-2 inline-block w-6 border-t-2 border-dashed border-teal-700 align-middle" />Sensitivity tail to 0%</span> : null}
+                  <span>Lowest exact-cohort offer: {formatMoney(model?.observedAmountMin)}</span>
+                  <span>Default endpoint (99th percentile): {formatMoney(model?.evidenceAmountMax)}</span>
+                  <span>Highest observed offer: {formatMoney(model?.observedAmountMax)}</span>
                 </div>
               </div>
+            </section>
 
-              <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+            <section className={activePage === 'strategy' ? 'grid gap-4 lg:grid-cols-3' : 'hidden'}>
+              <div className="rounded-lg border border-slate-200 bg-white p-5 lg:col-span-3">
                 <h2 className="text-lg font-semibold">Strategy points</h2>
-                <div className="mt-3 space-y-3 text-sm">
+                <div className="mt-4 grid gap-4 lg:grid-cols-3">
                   {[
                     ['Conservative', model?.conservative],
                     ['Balanced', model?.recommended],
                     ['Aggressive', model?.aggressive],
-                    ['Slider', selectedModelPoint],
                   ].map(([label, point]) => {
                     const modelPoint = point as ModelPoint | null | undefined;
                     return (
-                      <div key={label as string} className="grid grid-cols-[1fr_auto] gap-x-3 border-b border-slate-100 pb-3 last:border-0 last:pb-0">
+                      <div key={label as string} className="grid grid-cols-[1fr_auto] gap-x-3 border-l-2 border-slate-200 pl-4">
                         <span className="font-medium text-slate-700">{label as string}</span>
                         <span className="text-right font-semibold tabular-nums">{formatMoney(modelPoint?.amount)}</span>
                         <span className="text-slate-500">{formatPercent(modelPoint?.winProbability)} win chance</span>
@@ -1136,9 +1755,56 @@ export default function IdrConsole() {
               </div>
             </section>
 
-            <InfoTabs activeTab={infoTab} onChange={setInfoTab} />
+            <section className={activePage === 'strategy' ? 'rounded-lg border border-slate-200 bg-white p-5 text-sm leading-6 text-slate-600' : 'hidden'}>
+              <h2 className="font-semibold text-slate-950">Model scope</h2>
+              <p className="mt-2">{model?.scope ?? 'No eligible model scope.'}{model?.usedDefaults ? ' Default decisions were included because the non-default sample was sparse.' : ''}</p>
+              <p className="mt-2">The solid curve starts at the lowest reported exact-cohort provider offer and discounts the model cohort&apos;s base win rate as fewer historical provider-winning offer/QPA ratios support a higher amount. The optional dashed tail begins at the exact cohort&apos;s 99th-percentile offer and decays to zero. Recommendations never use that extrapolated tail.</p>
+            </section>
 
-            <section className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-4">
+            <section className={activePage === 'guide' ? 'space-y-5' : 'hidden'}>
+              <div>
+                <h1 className="text-2xl font-semibold">Guide and methodology</h1>
+                <p className="mt-2 text-sm text-slate-500">Definitions for the inputs, strategy points, and model boundaries.</p>
+              </div>
+              <div className="grid gap-8 rounded-lg border border-slate-200 bg-white p-6 lg:grid-cols-[0.8fr_1.2fr]">
+                <div><h2 className="text-lg font-semibold">Place of service</h2><p className="mt-2 text-sm leading-6 text-slate-600">The two-digit CMS code for the care setting attached to the disputed line item.</p></div>
+                <dl className="grid grid-cols-[80px_minmax(0,1fr)] gap-x-4 gap-y-3 text-sm">
+                  <dt className="font-semibold">21</dt><dd>Inpatient hospital</dd>
+                  <dt className="font-semibold">22</dt><dd>Outpatient hospital</dd>
+                  <dt className="font-semibold">23</dt><dd>Emergency room - hospital</dd>
+                  <dt className="font-semibold">24</dt><dd>Ambulatory surgical center</dd>
+                  <dt className="font-semibold">N/R</dt><dd>Not reported in the source row</dd>
+                </dl>
+              </div>
+              <div className="grid gap-8 rounded-lg border border-slate-200 bg-white p-6 lg:grid-cols-[0.8fr_1.2fr]">
+                <div><h2 className="text-lg font-semibold">Strategy points</h2><p className="mt-2 text-sm leading-6 text-slate-600">All recommendations stay inside the historically supported portion of the curve.</p></div>
+                <dl className="grid grid-cols-[120px_minmax(0,1fr)] gap-x-4 gap-y-3 text-sm leading-6">
+                  <dt className="font-semibold">Conservative</dt><dd>Highest expected payment clearing an 80% estimated win rate, or your higher selected floor.</dd>
+                  <dt className="font-semibold">Balanced</dt><dd>Highest expected payment clearing the win-rate floor you set.</dd>
+                  <dt className="font-semibold">Aggressive</dt><dd>Highest expected payment inside empirical support, without a minimum win-rate constraint.</dd>
+                  <dt className="font-semibold">Slider</dt><dd>Your test offer. It may move into the extrapolated tail, where the estimate is clearly flagged.</dd>
+                </dl>
+              </div>
+              <div className="grid gap-8 rounded-lg border border-slate-200 bg-white p-6 lg:grid-cols-[0.8fr_1.2fr]">
+                <div><h2 className="text-lg font-semibold">How the curve works</h2><p className="mt-2 text-sm leading-6 text-slate-600">Raw outcomes and decision sensitivity are shown separately because historical offer size is confounded by case strength and selection.</p></div>
+                <div className="space-y-3 text-sm leading-6 text-slate-600">
+                  <p>The case plot is the observed evidence. For some codes, including 63047 in the pooled data, raw win rates are flat or higher at larger offers. That does not establish that asking more improves the same case; stronger cases may both ask more and win more often.</p>
+                  <p>The offer curve is a winning-offer support model. It begins with the model cohort&apos;s base provider win rate, then reduces that probability according to the smoothed share of historical provider-winning offer/QPA ratios that reached or exceeded each proposed amount.</p>
+                  <p>The solid linear axis starts at the lowest exact-cohort offer and normally ends at that cohort&apos;s 99th percentile. The optional dashed tail extends to the highest observed offer and decays to 0%. It is a sensitivity extrapolation, not observed CMS evidence.</p>
+                  <p>Expected payment equals win probability times the provider offer, plus loss probability times the median issuer offer. It is not profit and does not include costs, fees, delays, or collection risk.</p>
+                </div>
+              </div>
+              <div className="grid gap-8 rounded-lg border border-slate-200 bg-white p-6 lg:grid-cols-[0.8fr_1.2fr]">
+                <div><h2 className="text-lg font-semibold">Sources and limitations</h2><p className="mt-2 text-sm leading-6 text-slate-600">Descriptive decision support built from the local public-use files.</p></div>
+                <div className="space-y-3 text-sm leading-6 text-slate-600">
+                  <p>Matched {formatNumber(sourceRows)} local Federal IDR PUF rows across 2023-2025. Dataset generated {dataGenerated}.</p>
+                  <p>CMS-suppressed dollar cells remain in outcome counts but are excluded from amount, ratio, and model calculations. Certified IDR Entity begins in 2025 Q3.</p>
+                  <p>State filtering parses every abbreviation in each published geography, so cross-state markets are available from every included state.</p>
+                </div>
+              </div>
+            </section>
+
+            <section className={activePage === 'outcomes' ? 'grid gap-4 lg:grid-cols-2 2xl:grid-cols-4' : 'hidden'}>
               <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
                 <h3 className="text-base font-semibold">Outcome mix</h3>
                 <dl className="mt-3 grid grid-cols-2 gap-y-2 text-sm">
@@ -1198,14 +1864,14 @@ export default function IdrConsole() {
               </div>
             </section>
 
-            <div className="grid gap-4 2xl:grid-cols-2">
+            <div className={activePage === 'breakdowns' ? 'grid gap-4 2xl:grid-cols-2' : 'hidden'}>
               <SegmentTable title="By year and quarter" rows={yearSegments} />
               <SegmentTable title="By certified IDR entity" rows={entitySegments} />
               <SegmentTable title="By geography" rows={geographySegments} />
               <SegmentTable title="By place of service" rows={placeSegments} />
             </div>
 
-            <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+            <section className={activePage === 'comparables' ? 'rounded-lg border border-slate-200 bg-white p-4 shadow-sm' : 'hidden'}>
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <h2 className="text-lg font-semibold">Comparable rows</h2>
                 <p className="text-sm text-slate-500">Showing newest 50 exact-filter rows</p>

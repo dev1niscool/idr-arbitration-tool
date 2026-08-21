@@ -1,8 +1,8 @@
 # Federal IDR Offer Console
 
-A local decision-support web app for reviewing Federal IDR arbitration outcomes by CPT code, geography, certified IDR entity, place of service, and data period.
+A local decision-support web app for reviewing Federal IDR arbitration outcomes by CPT code, state and market geography, certified IDR entity, place of service, and data period.
 
-The app uses a compact JSON dataset generated from the local CMS Federal IDR PUF files plus the billing-code files in this project. It is decision support only, not legal, coding, reimbursement, or valuation advice.
+The app uses an uncompressed JSON dataset generated from the local CMS Federal IDR PUF files plus the billing-code files in this project. It is decision support only, not legal, coding, reimbursement, or valuation advice.
 
 ## Local Development
 
@@ -73,5 +73,10 @@ Use the `Entity-labeled only: 2025 Q3 and Q4` checkbox in the app when you want 
 ## Notes
 
 - CMS-suppressed dollar cells are counted in outcome totals, but excluded from amount statistics and recommendation modeling.
-- The recommendation model estimates win probability from comparable historical provider-offer-to-QPA ratios.
+- The historical outcome plot shows every exact-filter row with a reported provider offer and provider/plan outcome. Green dots are provider wins and red dots are plan wins; hovering shows the row details available in the local dataset.
+- The offer curve is a decision-sensitivity model, not a causal estimate from raw offer-size correlations. It starts with the selected model cohort's base provider win rate and discounts it as fewer historical provider-winning offer-to-QPA ratios support a higher proposed amount.
+- The offer curve uses a linear dollar axis beginning at the lowest provider offer in the exact selected cohort. Its default endpoint is that cohort's 99th-percentile provider offer.
+- `Show extrapolation` reveals a dashed sensitivity tail that includes the highest exact-cohort provider offer and decays to zero at the tail endpoint. Extrapolated points are never eligible for recommendation.
+- Double-click the offer curve's rightmost x-axis amount to enter a smaller maximum for the current view.
 - Expected value uses the proposed provider offer if the provider wins and the median issuer offer as the loss-side proxy.
+- Multi-state CMS markets appear under every state named in the geography. For example, Chicago-Naperville-Elgin, IL-IN-WI is available under Illinois, Indiana, and Wisconsin.
