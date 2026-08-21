@@ -134,6 +134,18 @@ type SegmentRow = {
   medianPrevailing: number | null;
 };
 
+type OfferBucket = {
+  index: number;
+  label: string;
+  rows: number;
+  providerWins: number;
+  issuerWins: number;
+  winRate: number;
+  minOffer: number;
+  maxOffer: number;
+  medianOffer: number;
+};
+
 type ResultsPage = 'strategy' | 'outcomes' | 'breakdowns' | 'comparables' | 'guide';
 
 const ALL = '__all__';
@@ -525,6 +537,35 @@ function groupSegments(
     .slice(0, limit);
 }
 
+function buildOfferBuckets(records: RecordTuple[], bucketCount = 6): OfferBucket[] {
+  const rows = offerOutcomeRows(records).sort(
+    (left, right) => (left[7] as number) - (right[7] as number),
+  );
+  if (rows.length < bucketCount) return [];
+
+  return Array.from({ length: bucketCount }, (_, index) => {
+    const start = Math.floor((index * rows.length) / bucketCount);
+    const end = Math.floor(((index + 1) * rows.length) / bucketCount);
+    const bucketRows = rows.slice(start, end);
+    const offers = bucketRows.map((record) => record[7] as number);
+    const providerWins = bucketRows.filter((record) => record[10] === 0).length;
+    const issuerWins = bucketRows.length - providerWins;
+    const position = index === 0 ? 'Lowest' : index === bucketCount - 1 ? 'Highest' : '';
+
+    return {
+      index,
+      label: position ? `Bucket ${index + 1} - ${position}` : `Bucket ${index + 1}`,
+      rows: bucketRows.length,
+      providerWins,
+      issuerWins,
+      winRate: providerWins / bucketRows.length,
+      minOffer: offers[0],
+      maxOffer: offers[offers.length - 1],
+      medianOffer: median(offers) ?? offers[0],
+    };
+  });
+}
+
 function Metric({
   label,
   value,
@@ -587,6 +628,200 @@ function SegmentTable({ title, rows }: { title: string; rows: SegmentRow[] }) {
         </table>
       </div>
     </section>
+  );
+}
+
+function OfferBucketChart({ records }: { records: RecordTuple[] }) {
+  const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const buckets = useMemo(() => buildOfferBuckets(records), [records]);
+
+  if (!buckets.length) {
+    return (
+      <div className="flex h-64 items-center justify-center rounded-md border border-slate-200 bg-slate-50 px-6 text-center text-sm text-slate-500">
+        At least six exact-filter cases with a reported provider offer and provider/plan outcome are required.
+      </div>
+    );
+  }
+
+  const width = 920;
+  const height = 430;
+  const padLeft = 84;
+  const padRight = 72;
+  const padTop = 62;
+  const padBottom = 94;
+  const chartWidth = width - padLeft - padRight;
+  const chartHeight = height - padTop - padBottom;
+  const plotBottom = padTop + chartHeight;
+  const bucketWidth = chartWidth / buckets.length;
+  const barWidth = Math.min(72, bucketWidth * 0.52);
+  const largestMedian = Math.max(...buckets.map((bucket) => bucket.medianOffer));
+  const amountAxisMax = Math.max(largestMedian, roundOffer(largestMedian * 1.12));
+  const xFor = (index: number) => padLeft + bucketWidth * (index + 0.5);
+  const amountYFor = (amount: number) => plotBottom - (amount / amountAxisMax) * chartHeight;
+  const winYFor = (rate: number) => plotBottom - rate * chartHeight;
+  const linePoints = buckets.map((bucket) => `${xFor(bucket.index)},${winYFor(bucket.winRate)}`).join(' ');
+  const activeBucket = activeIndex === null ? null : buckets[activeIndex];
+  const activeX = activeBucket ? xFor(activeBucket.index) : 0;
+  const tooltipWidth = 246;
+  const tooltipHeight = 132;
+  const tooltipX = Math.min(width - padRight - tooltipWidth, Math.max(padLeft, activeX - tooltipWidth / 2));
+  const tooltipY = padTop + 8;
+
+  return (
+    <div className="overflow-hidden rounded-md border border-slate-200 bg-white">
+      <div className="overflow-x-auto">
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          className="h-auto min-w-[760px] w-full"
+          role="img"
+          aria-label="Six provider-offer buckets comparing median provider offer amount with observed provider win rate"
+          onMouseLeave={() => setActiveIndex(null)}
+        >
+          <rect x="0" y="0" width={width} height={height} fill="#ffffff" />
+          <text x={padLeft} y="26" fontSize="12" fontWeight="700" fill="#475569">
+            Median provider offer
+          </text>
+          <text x={width - padRight} y="26" textAnchor="end" fontSize="12" fontWeight="700" fill="#0f766e">
+            Provider win rate
+          </text>
+
+          {Array.from({ length: 5 }, (_, index) => {
+            const fraction = index / 4;
+            const y = plotBottom - fraction * chartHeight;
+            return (
+              <g key={fraction}>
+                <line x1={padLeft} x2={width - padRight} y1={y} y2={y} stroke="#e2e8f0" />
+                <text x={padLeft - 12} y={y + 4} textAnchor="end" fontSize="11" fill="#64748b">
+                  {formatMoney(amountAxisMax * fraction)}
+                </text>
+                <text x={width - padRight + 12} y={y + 4} fontSize="11" fill="#0f766e">
+                  {formatPercent(fraction)}
+                </text>
+              </g>
+            );
+          })}
+
+          {buckets.map((bucket) => {
+            const x = xFor(bucket.index);
+            const barY = amountYFor(bucket.medianOffer);
+            const active = activeIndex === bucket.index;
+            const shortLabel = bucket.index === 0 ? '1 - Lowest' : bucket.index === buckets.length - 1 ? '6 - Highest' : `${bucket.index + 1}`;
+            return (
+              <g
+                key={bucket.index}
+                tabIndex={0}
+                role="button"
+                aria-label={`${bucket.label}: median offer ${formatMoney(bucket.medianOffer)}, provider win rate ${formatPercent(bucket.winRate, 1)}, ${formatNumber(bucket.rows)} cases`}
+                onMouseEnter={() => setActiveIndex(bucket.index)}
+                onFocus={() => setActiveIndex(bucket.index)}
+                onBlur={() => setActiveIndex(null)}
+                onClick={() => setActiveIndex(bucket.index)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    setActiveIndex(bucket.index);
+                  }
+                }}
+                className="cursor-pointer outline-none"
+              >
+                <rect
+                  x={x - bucketWidth / 2 + 2}
+                  y={padTop}
+                  width={bucketWidth - 4}
+                  height={chartHeight}
+                  fill="transparent"
+                />
+                <rect
+                  x={x - barWidth / 2}
+                  y={barY}
+                  width={barWidth}
+                  height={Math.max(1, plotBottom - barY)}
+                  rx="3"
+                  fill={active ? '#334155' : '#64748b'}
+                  opacity={active ? 1 : 0.82}
+                />
+                <text x={x} y={plotBottom + 25} textAnchor="middle" fontSize="12" fontWeight="700" fill="#334155">
+                  {shortLabel}
+                </text>
+                <text x={x} y={plotBottom + 45} textAnchor="middle" fontSize="11" fill="#64748b">
+                  {formatMoney(bucket.medianOffer)} median
+                </text>
+              </g>
+            );
+          })}
+
+          <polyline points={linePoints} fill="none" stroke="#0f766e" strokeWidth="3" strokeLinejoin="round" strokeLinecap="round" pointerEvents="none" />
+          {buckets.map((bucket) => {
+            const x = xFor(bucket.index);
+            const y = winYFor(bucket.winRate);
+            return (
+              <g key={`rate-${bucket.index}`} pointerEvents="none">
+                <circle cx={x} cy={y} r={activeIndex === bucket.index ? 7 : 5.5} fill="#ffffff" stroke="#0f766e" strokeWidth="3" />
+                <text x={x} y={Math.max(padTop + 12, y - 12)} textAnchor="middle" fontSize="12" fontWeight="700" fill="#0f766e">
+                  {formatPercent(bucket.winRate, 1)}
+                </text>
+              </g>
+            );
+          })}
+
+          {activeBucket ? (
+            <g pointerEvents="none">
+              <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} rx="6" fill="#0f172a" opacity="0.97" />
+              <text x={tooltipX + 14} y={tooltipY + 24} fontSize="13" fontWeight="700" fill="#ffffff">
+                {activeBucket.label}
+              </text>
+              <text x={tooltipX + 14} y={tooltipY + 47} fontSize="12" fill="#cbd5e1">
+                Offer range: {formatMoney(activeBucket.minOffer)} to {formatMoney(activeBucket.maxOffer)}
+              </text>
+              <text x={tooltipX + 14} y={tooltipY + 68} fontSize="12" fill="#cbd5e1">
+                Median offer: {formatMoney(activeBucket.medianOffer)}
+              </text>
+              <text x={tooltipX + 14} y={tooltipY + 89} fontSize="12" fill="#cbd5e1">
+                Provider / plan wins: {formatNumber(activeBucket.providerWins)} / {formatNumber(activeBucket.issuerWins)}
+              </text>
+              <text x={tooltipX + 14} y={tooltipY + 112} fontSize="13" fontWeight="700" fill="#5eead4">
+                {formatPercent(activeBucket.winRate, 1)} provider win rate
+              </text>
+            </g>
+          ) : null}
+        </svg>
+      </div>
+
+      <div className="flex flex-wrap gap-x-6 gap-y-2 border-t border-slate-100 px-4 py-3 text-xs text-slate-600">
+        <span><span className="mr-2 inline-block h-2.5 w-5 rounded-sm bg-slate-500 align-middle" />Median provider offer</span>
+        <span><span className="mr-2 inline-block h-0.5 w-6 bg-teal-700 align-middle" />Observed provider win rate</span>
+        <span>{formatNumber(buckets.reduce((sum, bucket) => sum + bucket.rows, 0))} exact-filter cases divided by offer rank</span>
+      </div>
+
+      <div className="overflow-x-auto border-t border-slate-100 px-4 pb-3">
+        <table className="w-full min-w-[760px] text-left text-xs">
+          <thead className="text-slate-500">
+            <tr className="border-b border-slate-200">
+              <th className="py-2 pr-3 font-semibold">Bucket</th>
+              <th className="px-3 py-2 text-right font-semibold">Offer range</th>
+              <th className="px-3 py-2 text-right font-semibold">Median offer</th>
+              <th className="px-3 py-2 text-right font-semibold">Cases</th>
+              <th className="px-3 py-2 text-right font-semibold">Provider wins</th>
+              <th className="px-3 py-2 text-right font-semibold">Plan wins</th>
+              <th className="py-2 pl-3 text-right font-semibold">Win rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {buckets.map((bucket) => (
+              <tr key={bucket.index} className="border-b border-slate-100 last:border-0">
+                <th className="py-2 pr-3 font-medium text-slate-700">{bucket.label}</th>
+                <td className="px-3 py-2 text-right tabular-nums">{formatMoney(bucket.minOffer)} to {formatMoney(bucket.maxOffer)}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{formatMoney(bucket.medianOffer)}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{formatNumber(bucket.rows)}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-green-700">{formatNumber(bucket.providerWins)}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-red-700">{formatNumber(bucket.issuerWins)}</td>
+                <td className="py-2 pl-3 text-right font-semibold tabular-nums text-teal-800">{formatPercent(bucket.winRate, 1)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 
@@ -1772,6 +2007,19 @@ export default function IdrConsole() {
               <p className="mt-2">The solid curve starts at the lowest reported exact-cohort provider offer. At each amount it estimates the provider win fraction among historical rows with nearby provider offers, then applies modest shrinkage toward the model cohort&apos;s base win rate. The default view ends at the 99th percentile; expanding the chart keeps the curve solid through the highest observed offer, then shows a dashed sensitivity tail to zero. Recommendations stay within the default range and never use that tail.</p>
             </section>
 
+            <section className={activePage === 'strategy' ? 'min-w-0 rounded-lg border border-slate-200 bg-white p-4 shadow-sm' : 'hidden'}>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-semibold">Offer bucket comparison</h2>
+                  <p className="mt-1 text-sm leading-5 text-slate-500">Six roughly equal-count groups ordered from the lowest to highest actual provider offers. Bars compare median offer size; the line compares observed provider win rate.</p>
+                </div>
+                <p className="text-sm text-slate-500">Hover, tap, or focus a bucket for details</p>
+              </div>
+              <div className="mt-4">
+                <OfferBucketChart records={exactRecords} />
+              </div>
+            </section>
+
             <section className={activePage === 'guide' ? 'space-y-5' : 'hidden'}>
               <div>
                 <h1 className="text-2xl font-semibold">Guide and methodology</h1>
@@ -1803,6 +2051,7 @@ export default function IdrConsole() {
                   <p>The offer curve estimates the local historical provider win rate with an adaptive nearest-neighbor smoother. For every proposed amount, it compares provider wins and plan wins among rows with nearby provider offers and modestly shrinks the result toward the model cohort&apos;s overall win rate. The hover panel reports the effective local sample size.</p>
                   <p>The supported curve is not forced downward. It may rise or fall where nearby historical outcomes do. This is an observational association, not proof that changing the offer alone causes the estimated change.</p>
                   <p>The solid linear axis starts at the lowest exact-cohort offer and normally ends at that cohort&apos;s 99th percentile. Show extrapolation expands the solid empirical curve through the highest observed offer, then adds a dashed sensitivity tail beyond the observed maximum that decays to 0%.</p>
+                  <p>The offer bucket comparison sorts every exact-filter case with a reported provider offer and provider/plan outcome, then divides the ranked rows into six roughly equal-count groups. Bars show each group&apos;s median offer and the line shows its raw provider win rate. Equal dollar values may straddle adjacent groups when many cases report the same offer.</p>
                   <p>Expected payment equals win probability times the provider offer, plus loss probability times the median issuer offer. It is not profit and does not include costs, fees, delays, or collection risk.</p>
                 </div>
               </div>
