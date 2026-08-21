@@ -156,6 +156,15 @@ const DEFAULT_YEARS = [2023, 2024, 2025];
 const ENTITY_ONLY_PERIOD_LABEL = '2025 Q3-Q4';
 const ENTITY_NOT_REPORTED = 'Not reported in selected source';
 const UNKNOWN_REGIONS = new Set(['N/R', 'NR', 'N/A']);
+const PLACE_OF_SERVICE_GUIDE = [
+  ['11', 'Office'],
+  ['19', 'Off-campus outpatient hospital'],
+  ['21', 'Inpatient hospital'],
+  ['22', 'On-campus outpatient hospital'],
+  ['23', 'Emergency room - hospital'],
+  ['24', 'Ambulatory surgical center'],
+  ['N/R', 'Not reported in the source row'],
+] as const;
 const STATE_NAMES: Record<string, string> = {
   AK: 'Alaska', AL: 'Alabama', AR: 'Arkansas', AZ: 'Arizona', CA: 'California',
   CO: 'Colorado', CT: 'Connecticut', DC: 'District of Columbia', DE: 'Delaware',
@@ -1363,6 +1372,23 @@ export default function IdrConsole() {
     [codeRecords, entityOnlyPeriods, selectedYears],
   );
 
+  const ediphyGeographyExample = useMemo(() => {
+    if (!data) return null;
+    const entityIndex = data.dictionaries.entities.findIndex((entity) => entity.startsWith('EdiPhy Advisors'));
+    const metroIndex = data.dictionaries.regions.indexOf('New York-Newark-Jersey City, NY-NJ-PA');
+    const statenIslandIndex = data.dictionaries.regions.indexOf('Staten Island, NY');
+    if (entityIndex < 0 || metroIndex < 0 || statenIslandIndex < 0) return null;
+
+    let metroRows = 0;
+    let statenIslandRows = 0;
+    for (const record of data.records) {
+      if (record[2] !== entityIndex) continue;
+      if (record[1] === metroIndex) metroRows += 1;
+      if (record[1] === statenIslandIndex) statenIslandRows += 1;
+    }
+    return { metroRows, statenIslandRows };
+  }, [data]);
+
   const regionOptions = useMemo(() => {
     if (!data) return [];
     return uniqueSorted(data.dictionaries.regions.filter((region) => !UNKNOWN_REGIONS.has(region)));
@@ -1690,6 +1716,36 @@ export default function IdrConsole() {
                   <option value={ALL}>All places of service</option>
                   {placeOptions.map((place) => <option key={place} value={place}>POS {place}</option>)}
                 </select>
+                <details className="group mt-2 rounded-md border border-slate-200 bg-slate-50">
+                  <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs font-semibold text-slate-700 outline-none focus-visible:ring-2 focus-visible:ring-teal-100">
+                    <Info size={15} className="shrink-0 text-teal-700" aria-hidden="true" />
+                    <span className="flex-1">What does place of service mean?</span>
+                    <ChevronDown size={15} className="shrink-0 text-slate-500 transition group-open:rotate-180" aria-hidden="true" />
+                  </summary>
+                  <div className="border-t border-slate-200 px-3 py-3 text-xs leading-5 text-slate-600">
+                    <p>POS is the two-digit CMS code on the professional claim that identifies where the service was rendered. Select the setting reported on the disputed line, not the surgeon&apos;s office location.</p>
+                    <dl className="mt-3 grid grid-cols-[42px_minmax(0,1fr)] gap-x-3 gap-y-1.5">
+                      {PLACE_OF_SERVICE_GUIDE.map(([code, label]) => (
+                        <div key={code} className="contents">
+                          <dt className="font-semibold text-slate-800">{code}</dt>
+                          <dd>{label}</dd>
+                        </div>
+                      ))}
+                    </dl>
+                    <a href="https://www.cms.gov/medicare/coding-billing/place-of-service-codes/code-sets" target="_blank" rel="noreferrer" className="mt-3 inline-block font-semibold text-teal-800 hover:text-teal-950">
+                      View the full CMS POS code set
+                    </a>
+                  </div>
+                </details>
+              </div>
+
+              <div className="flex gap-3 border-l-2 border-teal-700 bg-slate-50 px-4 py-3 lg:col-span-2">
+                <Info size={18} className="mt-0.5 shrink-0 text-teal-700" aria-hidden="true" />
+                <div className="text-sm leading-6 text-slate-600">
+                  <p className="font-semibold text-slate-900">Recommended filter order: start with the IDR entity</p>
+                  <p className="mt-1">Select the assigned entity and leave geography broad first. Run the analysis, then open <span className="font-semibold text-slate-800">Breakdowns</span> and review <span className="font-semibold text-slate-800">By geography</span> to see the CMS market labels that entity actually uses. Return to the inputs and narrow to one or more of those regions only after you know where its rows are reported.</p>
+                  <p className="mt-2">Broad metro labels often absorb nearby boroughs and localities. {ediphyGeographyExample ? <>In the local entity-labeled data, EdiPhy Advisors has {formatNumber(ediphyGeographyExample.metroRows)} rows under <span className="font-semibold text-slate-800">New York-Newark-Jersey City</span> but only {formatNumber(ediphyGeographyExample.statenIslandRows)} under <span className="font-semibold text-slate-800">Staten Island</span>.</> : <>For example, EdiPhy Advisors primarily reports New York-area rows under <span className="font-semibold text-slate-800">New York-Newark-Jersey City</span>, not Staten Island.</>} Selecting Staten Island alone can therefore produce few or no matches even when the entity handles many New York-area disputes.</p>
+                </div>
               </div>
 
               <fieldset className="lg:col-span-2">
@@ -2148,12 +2204,23 @@ export default function IdrConsole() {
               <div className="grid gap-8 rounded-lg border border-slate-200 bg-white p-6 lg:grid-cols-[0.8fr_1.2fr]">
                 <div><h2 className="text-lg font-semibold">Place of service</h2><p className="mt-2 text-sm leading-6 text-slate-600">The two-digit CMS code for the care setting attached to the disputed line item.</p></div>
                 <dl className="grid grid-cols-[80px_minmax(0,1fr)] gap-x-4 gap-y-3 text-sm">
-                  <dt className="font-semibold">21</dt><dd>Inpatient hospital</dd>
-                  <dt className="font-semibold">22</dt><dd>Outpatient hospital</dd>
-                  <dt className="font-semibold">23</dt><dd>Emergency room - hospital</dd>
-                  <dt className="font-semibold">24</dt><dd>Ambulatory surgical center</dd>
-                  <dt className="font-semibold">N/R</dt><dd>Not reported in the source row</dd>
+                  {PLACE_OF_SERVICE_GUIDE.map(([code, label]) => (
+                    <div key={code} className="contents">
+                      <dt className="font-semibold">{code}</dt><dd>{label}</dd>
+                    </div>
+                  ))}
                 </dl>
+              </div>
+              <div className="grid gap-8 rounded-lg border border-slate-200 bg-white p-6 lg:grid-cols-[0.8fr_1.2fr]">
+                <div><h2 className="text-lg font-semibold">Entity-first geography workflow</h2><p className="mt-2 text-sm leading-6 text-slate-600">Avoid false zero-result cohorts caused by choosing a local label the assigned entity rarely reports.</p></div>
+                <div className="space-y-3 text-sm leading-6 text-slate-600">
+                  <ol className="list-decimal space-y-2 pl-5">
+                    <li>Select the assigned IDR entity and begin with all geographies, or all regions in the selected state.</li>
+                    <li>Run the analysis and open <span className="font-semibold text-slate-800">Breakdowns</span> to review the entity&apos;s rows <span className="font-semibold text-slate-800">By geography</span>.</li>
+                    <li>Return to the inputs and check the market regions that entity actually uses for the final focused analysis.</li>
+                  </ol>
+                  <p>CMS geography is a reported market label, not a precise patient or practice location. In the local entity-labeled data, EdiPhy Advisors reports {formatNumber(ediphyGeographyExample?.metroRows)} rows under New York-Newark-Jersey City and {formatNumber(ediphyGeographyExample?.statenIslandRows)} under Staten Island. A Staten Island-only filter can therefore hide most of the relevant New York-area history.</p>
+                </div>
               </div>
               <div className="grid gap-8 rounded-lg border border-slate-200 bg-white p-6 lg:grid-cols-[0.8fr_1.2fr]">
                 <div><h2 className="text-lg font-semibold">Strategy points</h2><p className="mt-2 text-sm leading-6 text-slate-600">All recommendations stay inside the historically supported portion of the curve.</p></div>

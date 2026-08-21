@@ -82,3 +82,4 @@ Use the `Entity-labeled only: 2025 Q3 and Q4` checkbox in the app when you want 
 - Expected value uses the proposed provider offer if the provider wins and the median issuer offer as the loss-side proxy.
 - After selecting a state, the region checkbox menu can combine multiple city or market regions into one exact-filter cohort. Leaving every region unchecked includes all regions in that state.
 - Multi-state CMS markets appear under every state named in the geography. For example, Chicago-Naperville-Elgin, IL-IN-WI is available under Illinois, Indiana, and Wisconsin.
+- The startup form includes a common place-of-service code guide and an entity-first geography workflow. Start broad with the assigned entity, review its `Breakdowns` by geography, and then narrow to the market labels that entity actually reports.
