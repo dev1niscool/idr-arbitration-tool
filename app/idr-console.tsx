@@ -148,6 +148,31 @@ type OfferBucket = {
   medianOffer: number;
 };
 
+type OfferOutcomeDistribution = {
+  label: string;
+  rows: number;
+  mean: number | null;
+  min: number | null;
+  p10: number | null;
+  p25: number | null;
+  median: number | null;
+  p75: number | null;
+  p90: number | null;
+  max: number | null;
+  color: string;
+  fill: string;
+};
+
+type FailureOfferBand = {
+  label: string;
+  rangeLabel: string;
+  rows: number;
+  providerWins: number;
+  issuerWins: number;
+  lossRate: number | null;
+  medianOffer: number | null;
+};
+
 type ResultsPage = 'strategy' | 'outcomes' | 'breakdowns' | 'comparables' | 'guide';
 
 const ALL = '__all__';
@@ -239,6 +264,34 @@ function quantile(values: number[], percentile: number) {
 
 function median(values: number[]) {
   return quantile(values, 0.5);
+}
+
+function average(values: number[]) {
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function buildOfferDistribution(
+  label: string,
+  rows: RecordTuple[],
+  color: string,
+  fill: string,
+): OfferOutcomeDistribution {
+  const offers = rows.map((record) => record[7]).filter(isFiniteNumber).filter((value) => value > 0);
+  return {
+    label,
+    rows: offers.length,
+    mean: average(offers),
+    min: offers.length ? Math.min(...offers) : null,
+    p10: quantile(offers, 0.1),
+    p25: quantile(offers, 0.25),
+    median: quantile(offers, 0.5),
+    p75: quantile(offers, 0.75),
+    p90: quantile(offers, 0.9),
+    max: offers.length ? Math.max(...offers) : null,
+    color,
+    fill,
+  };
 }
 
 function roundOffer(value: number) {
@@ -831,6 +884,290 @@ function OfferBucketChart({ records }: { records: RecordTuple[] }) {
             ))}
           </tbody>
         </table>
+      </div>
+    </div>
+  );
+}
+
+function OfferOutcomeAnalysis({ records, data }: { records: RecordTuple[]; data: IdrData }) {
+  const outcomeRows = useMemo(() => offerOutcomeRows(records), [records]);
+  const providerWinRows = useMemo(() => outcomeRows.filter((record) => record[10] === 0), [outcomeRows]);
+  const issuerWinRows = useMemo(() => outcomeRows.filter((record) => record[10] === 1), [outcomeRows]);
+  const distributions = useMemo(
+    () => [
+      buildOfferDistribution('Provider won', providerWinRows, '#15803d', '#dcfce7'),
+      buildOfferDistribution('Provider lost (plan won)', issuerWinRows, '#dc2626', '#fee2e2'),
+    ],
+    [issuerWinRows, providerWinRows],
+  );
+
+  const failureBands = useMemo<FailureOfferBand[]>(() => {
+    const failedOffers = issuerWinRows.map((record) => record[7] as number);
+    const p50 = quantile(failedOffers, 0.5);
+    const p75 = quantile(failedOffers, 0.75);
+    const p90 = quantile(failedOffers, 0.9);
+    if (!isFiniteNumber(p50) || !isFiniteNumber(p75) || !isFiniteNumber(p90)) return [];
+
+    const definitions = [
+      { label: 'At/above failed-offer P90', rangeLabel: `${formatMoney(p90)} and higher`, min: p90, max: null },
+      { label: 'Failed-offer P75 to P90', rangeLabel: `${formatMoney(p75)} to under ${formatMoney(p90)}`, min: p75, max: p90 },
+      { label: 'Failed-offer P50 to P75', rangeLabel: `${formatMoney(p50)} to under ${formatMoney(p75)}`, min: p50, max: p75 },
+      { label: 'Below failed-offer median', rangeLabel: `Under ${formatMoney(p50)}`, min: null, max: p50 },
+    ];
+
+    return definitions.map((definition) => {
+      const bandRows = outcomeRows.filter((record) => {
+        const amount = record[7] as number;
+        return (definition.min === null || amount >= definition.min) && (definition.max === null || amount < definition.max);
+      });
+      const providerWins = bandRows.filter((record) => record[10] === 0).length;
+      const issuerWins = bandRows.filter((record) => record[10] === 1).length;
+      const offers = bandRows.map((record) => record[7] as number);
+      return {
+        label: definition.label,
+        rangeLabel: definition.rangeLabel,
+        rows: bandRows.length,
+        providerWins,
+        issuerWins,
+        lossRate: bandRows.length ? issuerWins / bandRows.length : null,
+        medianOffer: median(offers),
+      };
+    });
+  }, [issuerWinRows, outcomeRows]);
+
+  const highestFailedRows = useMemo(
+    () => issuerWinRows.slice().sort((left, right) => (right[7] as number) - (left[7] as number)).slice(0, 20),
+    [issuerWinRows],
+  );
+
+  if (!outcomeRows.length) {
+    return (
+      <div className="flex h-64 items-center justify-center rounded-md border border-slate-200 bg-slate-50 px-6 text-center text-sm text-slate-500">
+        No exact-filter rows report both a provider offer and a provider/plan outcome.
+      </div>
+    );
+  }
+
+  const width = 920;
+  const height = 310;
+  const padLeft = 180;
+  const padRight = 28;
+  const padTop = 42;
+  const padBottom = 62;
+  const chartWidth = width - padLeft - padRight;
+  const scaleCandidates = distributions
+    .flatMap((distribution) => [distribution.mean, distribution.p90])
+    .filter(isFiniteNumber);
+  const largestScaleValue = Math.max(1, ...scaleCandidates);
+  const amountAxisMax = Math.max(largestScaleValue, roundOffer(largestScaleValue * 1.12));
+  const xFor = (amount: number) => padLeft + (amount / amountAxisMax) * chartWidth;
+  const rowY = [104, 206];
+  const xTicks = Array.from({ length: 5 }, (_, index) => (amountAxisMax * index) / 4);
+
+  return (
+    <div className="space-y-5">
+      <div className="grid gap-4 border-y border-slate-200 py-4 md:grid-cols-2">
+        {distributions.map((distribution) => (
+          <div key={distribution.label} className="grid grid-cols-[1fr_auto] gap-x-4 border-l-2 pl-4" style={{ borderColor: distribution.color }}>
+            <p className="font-semibold text-slate-800">Average offer: {distribution.label.toLowerCase()}</p>
+            <p className="text-xl font-semibold tabular-nums text-slate-950">{formatMoney(distribution.mean)}</p>
+            <p className="text-xs text-slate-500">{formatNumber(distribution.rows)} reported provider offers</p>
+            <p className="text-right text-xs tabular-nums text-slate-500">Median {formatMoney(distribution.median)}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="overflow-hidden rounded-md border border-slate-200 bg-white">
+        <div className="overflow-x-auto">
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            className="h-auto min-w-[760px] w-full"
+            role="img"
+            aria-label="Provider offer distributions for provider wins and provider losses using a shared linear dollar scale"
+          >
+            <rect width={width} height={height} fill="#ffffff" />
+            {xTicks.map((tick) => (
+              <g key={tick}>
+                <line x1={xFor(tick)} x2={xFor(tick)} y1={padTop} y2={height - padBottom} stroke="#e2e8f0" />
+                <text x={xFor(tick)} y={height - 32} textAnchor={tick === 0 ? 'start' : tick === amountAxisMax ? 'end' : 'middle'} fontSize="11" fill="#64748b">
+                  {formatMoney(tick)}
+                </text>
+              </g>
+            ))}
+
+            {distributions.map((distribution, index) => {
+              const y = rowY[index];
+              if (![distribution.mean, distribution.p10, distribution.p25, distribution.median, distribution.p75, distribution.p90].every(isFiniteNumber)) {
+                return (
+                  <text key={distribution.label} x={padLeft} y={y + 4} fontSize="12" fill="#64748b">
+                    No reported offers for this outcome.
+                  </text>
+                );
+              }
+              const p10 = distribution.p10 as number;
+              const p25 = distribution.p25 as number;
+              const medianValue = distribution.median as number;
+              const p75 = distribution.p75 as number;
+              const p90 = distribution.p90 as number;
+              const meanValue = distribution.mean as number;
+              return (
+                <g key={distribution.label}>
+                  <text x={padLeft - 18} y={y - 5} textAnchor="end" fontSize="13" fontWeight="700" fill="#334155">
+                    {distribution.label}
+                  </text>
+                  <text x={padLeft - 18} y={y + 14} textAnchor="end" fontSize="11" fill="#64748b">
+                    n={formatNumber(distribution.rows)}
+                  </text>
+                  <line x1={xFor(p10)} x2={xFor(p90)} y1={y} y2={y} stroke={distribution.color} strokeWidth="3" />
+                  <line x1={xFor(p10)} x2={xFor(p10)} y1={y - 10} y2={y + 10} stroke={distribution.color} strokeWidth="2" />
+                  <line x1={xFor(p90)} x2={xFor(p90)} y1={y - 10} y2={y + 10} stroke={distribution.color} strokeWidth="2" />
+                  <rect x={xFor(p25)} y={y - 18} width={Math.max(2, xFor(p75) - xFor(p25))} height="36" rx="3" fill={distribution.fill} stroke={distribution.color} strokeWidth="2" />
+                  <line x1={xFor(medianValue)} x2={xFor(medianValue)} y1={y - 18} y2={y + 18} stroke={distribution.color} strokeWidth="3" />
+                  <circle cx={xFor(meanValue)} cy={y} r="6" fill={distribution.color} stroke="#ffffff" strokeWidth="2" />
+                </g>
+              );
+            })}
+
+            <text x={width / 2} y={height - 8} textAnchor="middle" fontSize="12" fontWeight="700" fill="#475569">
+              Actual provider offer in reported cases (linear scale)
+            </text>
+          </svg>
+        </div>
+        <div className="flex flex-wrap gap-x-6 gap-y-2 border-t border-slate-100 px-4 py-3 text-xs text-slate-600">
+          <span>Whiskers: P10 to P90</span>
+          <span>Box: P25 to P75</span>
+          <span>Vertical line: median</span>
+          <span><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-slate-700 align-middle" />Dot: arithmetic average</span>
+        </div>
+      </div>
+
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[980px] text-left text-sm">
+          <thead className="text-xs uppercase tracking-[0.08em] text-slate-500">
+            <tr className="border-b border-slate-200">
+              <th className="py-2 pr-3 font-semibold">Outcome</th>
+              <th className="px-3 py-2 text-right font-semibold">Offers</th>
+              <th className="px-3 py-2 text-right font-semibold">Average</th>
+              <th className="px-3 py-2 text-right font-semibold">P10</th>
+              <th className="px-3 py-2 text-right font-semibold">P25</th>
+              <th className="px-3 py-2 text-right font-semibold">Median</th>
+              <th className="px-3 py-2 text-right font-semibold">P75</th>
+              <th className="px-3 py-2 text-right font-semibold">P90</th>
+              <th className="px-3 py-2 text-right font-semibold">Minimum</th>
+              <th className="py-2 pl-3 text-right font-semibold">Maximum</th>
+            </tr>
+          </thead>
+          <tbody>
+            {distributions.map((distribution) => (
+              <tr key={distribution.label} className="border-b border-slate-100 last:border-0">
+                <th className="py-2 pr-3 font-medium text-slate-700">{distribution.label}</th>
+                <td className="px-3 py-2 text-right tabular-nums">{formatNumber(distribution.rows)}</td>
+                <td className="px-3 py-2 text-right font-semibold tabular-nums">{formatMoney(distribution.mean)}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{formatMoney(distribution.p10)}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{formatMoney(distribution.p25)}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{formatMoney(distribution.median)}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{formatMoney(distribution.p75)}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{formatMoney(distribution.p90)}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{formatMoney(distribution.min)}</td>
+                <td className="py-2 pl-3 text-right tabular-nums">{formatMoney(distribution.max)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="border-t border-slate-200 pt-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="font-semibold text-slate-950">High failed-offer analysis</h3>
+            <p className="mt-1 max-w-3xl text-sm leading-5 text-slate-500">Bands are defined by the provider-offer distribution in plan wins, then compared against every provider/plan outcome in the same dollar range.</p>
+          </div>
+          <p className="text-sm text-slate-500">{formatNumber(issuerWinRows.length)} failed offers in the exact cohort</p>
+        </div>
+
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full min-w-[780px] text-left text-sm">
+            <thead className="text-xs uppercase tracking-[0.08em] text-slate-500">
+              <tr className="border-b border-slate-200">
+                <th className="py-2 pr-3 font-semibold">Failed-offer band</th>
+                <th className="px-3 py-2 text-right font-semibold">Dollar range</th>
+                <th className="px-3 py-2 text-right font-semibold">All cases</th>
+                <th className="px-3 py-2 text-right font-semibold">Provider wins</th>
+                <th className="px-3 py-2 text-right font-semibold">Plan wins</th>
+                <th className="px-3 py-2 text-right font-semibold">Observed loss rate</th>
+                <th className="py-2 pl-3 text-right font-semibold">Median offer</th>
+              </tr>
+            </thead>
+            <tbody>
+              {failureBands.length ? failureBands.map((band) => (
+                <tr key={band.label} className="border-b border-slate-100 last:border-0">
+                  <th className="py-2 pr-3 font-medium text-slate-700">{band.label}</th>
+                  <td className="px-3 py-2 text-right tabular-nums">{band.rangeLabel}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{formatNumber(band.rows)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums text-green-700">{formatNumber(band.providerWins)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums text-red-700">{formatNumber(band.issuerWins)}</td>
+                  <td className="px-3 py-2 text-right font-semibold tabular-nums text-red-700">{formatPercent(band.lossRate, 1)}</td>
+                  <td className="py-2 pl-3 text-right tabular-nums">{formatMoney(band.medianOffer)}</td>
+                </tr>
+              )) : (
+                <tr><td className="py-4 text-slate-500" colSpan={7}>No failed provider offers are reported for this exact cohort.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="border-t border-slate-200 pt-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h3 className="font-semibold text-slate-950">Highest provider offers that lost</h3>
+          <p className="text-sm text-slate-500">Showing highest {formatNumber(highestFailedRows.length)} of {formatNumber(issuerWinRows.length)}</p>
+        </div>
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full min-w-[1320px] text-left text-sm">
+            <thead className="text-xs uppercase tracking-[0.08em] text-slate-500">
+              <tr className="border-b border-slate-200">
+                <th className="py-2 pr-3 text-right font-semibold">Provider offer</th>
+                <th className="px-3 py-2 text-right font-semibold">QPA</th>
+                <th className="px-3 py-2 text-right font-semibold">Provider/QPA</th>
+                <th className="px-3 py-2 text-right font-semibold">Plan offer</th>
+                <th className="px-3 py-2 text-right font-semibold">Prevailing</th>
+                <th className="px-3 py-2 font-semibold">Region</th>
+                <th className="px-3 py-2 font-semibold">IDR entity</th>
+                <th className="px-3 py-2 font-semibold">POS</th>
+                <th className="px-3 py-2 font-semibold">Period</th>
+                <th className="py-2 pl-3 font-semibold">Default</th>
+              </tr>
+            </thead>
+            <tbody>
+              {highestFailedRows.length ? highestFailedRows.map((record, index) => {
+                const providerQpaRatio = isFiniteNumber(record[7]) && isFiniteNumber(record[6]) && record[6] > 0
+                  ? record[7] / record[6]
+                  : null;
+                return (
+                  <tr key={`${record.join('-')}-${index}`} className="border-b border-slate-100 last:border-0">
+                    <td className="py-2 pr-3 text-right font-semibold tabular-nums text-red-700">{formatMoney(record[7])}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{formatMoney(record[6])}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{formatRatio(providerQpaRatio)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{formatMoney(record[8])}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{formatMoney(record[9])}</td>
+                    <td className="max-w-[240px] px-3 py-2">{data.dictionaries.regions[record[1]]}</td>
+                    <td className="max-w-[240px] px-3 py-2">{data.dictionaries.entities[record[2]]}</td>
+                    <td className="px-3 py-2">{data.dictionaries.places[record[5]]}</td>
+                    <td className="px-3 py-2 tabular-nums">{record[3]} Q{record[4]}</td>
+                    <td className="py-2 pl-3">{data.defaultValues[record[11]]}</td>
+                  </tr>
+                );
+              }) : (
+                <tr><td className="py-4 text-slate-500" colSpan={10}>No failed provider offers are reported for this exact cohort.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="flex gap-2 border-l-2 border-amber-500 bg-amber-50 px-3 py-2.5 text-xs leading-5 text-amber-950">
+        <Info size={16} className="mt-0.5 shrink-0" aria-hidden="true" />
+        High historical offers that lost are cautionary comparables, not a universal ceiling. Case strength, payer offer, QPA, entity, geography, and other unreported factors can differ.
       </div>
     </div>
   );
@@ -2196,6 +2533,19 @@ export default function IdrConsole() {
               </div>
             </section>
 
+            <section className={activePage === 'strategy' ? 'min-w-0 rounded-lg border border-slate-200 bg-white p-4 shadow-sm' : 'hidden'}>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-semibold">Winning and failed provider offers</h2>
+                  <p className="mt-1 max-w-3xl text-sm leading-5 text-slate-500">Observed provider proposal amounts split by decision outcome for the exact selected cohort, with special attention to the upper tail of offers that lost.</p>
+                </div>
+                <p className="text-sm text-slate-500">Reported offers only</p>
+              </div>
+              <div className="mt-4">
+                <OfferOutcomeAnalysis records={exactRecords} data={data} />
+              </div>
+            </section>
+
             <section className={activePage === 'guide' ? 'space-y-5' : 'hidden'}>
               <div>
                 <h1 className="text-2xl font-semibold">Guide and methodology</h1>
@@ -2239,6 +2589,7 @@ export default function IdrConsole() {
                   <p>The supported curve is not forced downward. It may rise or fall where nearby historical outcomes do. This is an observational association, not proof that changing the offer alone causes the estimated change.</p>
                   <p>The solid linear axis starts at the lowest exact-cohort offer and normally ends at that cohort&apos;s 99th percentile. Show extrapolation expands the solid empirical curve through the highest observed offer, then adds a dashed sensitivity tail beyond the observed maximum that decays to 0%.</p>
                   <p>The offer bucket comparison sorts every exact-filter case with a reported provider offer and provider/plan outcome, then divides the ranked rows into six roughly equal-count groups. Bars show each group&apos;s median offer and the line shows its raw provider win rate. Equal dollar values may straddle adjacent groups when many cases report the same offer.</p>
+                  <p>The winning-versus-failed offer analysis is fully descriptive: it calculates the arithmetic average and P10/P25/P50/P75/P90 separately for provider wins and plan wins. Its loss-tail bands use percentiles from failed offers, then calculate the loss rate among every reported provider/plan outcome in each matching dollar range.</p>
                   <p>Expected payment equals win probability times the provider offer, plus loss probability times the median issuer offer. It is not profit and does not include costs, fees, delays, or collection risk.</p>
                 </div>
               </div>
