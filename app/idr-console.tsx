@@ -2124,7 +2124,7 @@ export default function IdrConsole() {
           </section>
         </div>
 
-        <footer className="px-5 pb-6 text-center text-xs text-slate-400">Made by Devin Kancherla</footer>
+        <footer className="px-5 pb-6 text-center text-xs text-slate-400">Made by dev1niscool</footer>
       </main>
     );
   }
