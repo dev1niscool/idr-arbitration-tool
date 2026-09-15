@@ -16,6 +16,19 @@ export const metadata: Metadata = {
   title: 'Federal IDR Offer Console',
   description:
     'A local decision-support dashboard for reviewing Federal IDR arbitration offer outcomes by CPT code, geography, entity, and year.',
+  robots: {
+    index: false,
+    follow: false,
+    nocache: true,
+    googleBot: {
+      index: false,
+      follow: false,
+      noimageindex: true,
+      'max-image-preview': 'none',
+      'max-snippet': -1,
+      'max-video-preview': -1,
+    },
+  },
 };
 
 export default function RootLayout({
